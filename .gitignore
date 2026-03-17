@@ -277,3 +277,6 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+
+
+my_ben/results/*
