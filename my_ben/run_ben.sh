@@ -12,7 +12,6 @@
 #     --linear-attn-backend triton
 
 python my_ben/bench_qwen35_block_forward.py \
-    --model-path /home/wjc/resources/models/qwen3_5_9b \
     --warmup-iters 20 \
     --bench-iters 100 \
     --batch-sizes 1 \

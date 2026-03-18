@@ -13,7 +13,7 @@ os.environ.setdefault(
 sys.path.insert(0, str(REPO_ROOT / "python"))
 sys.path.insert(0, str(REPO_ROOT))
 
-from my_ben.qwen35_hybrid_recovery.utils import now_stamp, write_outputs
+from my_ben.qwen35_hybrid_recovery.utils import now_stamp
 from sglang.srt.layers.attention.linear.utils import initialize_linear_attn_config
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
@@ -21,6 +21,7 @@ from .benches import run_block_forward_benchmarks
 from .config import parse_args, resolve_model_and_layers
 from .metadata import build_metadata
 from .plotting import generate_plots
+from .utils import write_block_outputs
 
 
 def main() -> None:
@@ -71,7 +72,7 @@ def main() -> None:
         full_layer_id=full_layer_id,
         cache_params=cache_params,
     )
-    write_outputs(output_dir, rows=rows, metadata=metadata)
+    write_block_outputs(output_dir, rows=rows, metadata=metadata)
     generate_plots(rows, output_dir)
 
     print(f"Saved benchmark results to {output_dir}")

@@ -10,7 +10,9 @@ from einops import rearrange
 from my_ben.qwen35_hybrid_recovery.utils import (
     add_row,
     benchmark_cuda_op,
-    write_outputs,
+    format_gb,
+    gbps,
+    nbytes_of_shape,
 )
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.configs.model_config import AttentionArch
@@ -381,7 +383,7 @@ class LinearBlockBench:
         self.cache_params = cache_params
         self.host_conv = [
             torch.randn(
-                (1, max_batch_size + 1) + conv_shape,
+                (max_batch_size + 1,) + conv_shape,
                 dtype=cache_params.dtype.conv,
                 device="cpu",
                 pin_memory=True,
@@ -389,7 +391,7 @@ class LinearBlockBench:
             for conv_shape in cache_params.shape.conv
         ]
         self.host_temporal = torch.randn(
-            (1, max_batch_size + 1) + cache_params.shape.temporal,
+            (max_batch_size + 1,) + cache_params.shape.temporal,
             dtype=cache_params.dtype.temporal,
             device="cpu",
             pin_memory=True,
@@ -428,30 +430,53 @@ class LinearBlockBench:
     def make_hidden_states(self, token_count: int) -> torch.Tensor:
         return torch.randn(token_count, self.config.hidden_size, dtype=self.dtype, device="cuda")
 
-    def _cache_indices(self, req_pool_indices: torch.Tensor) -> torch.Tensor:
-        return self.req_pool.get_mamba_indices(req_pool_indices)
+    def _slot_slice(self, batch_size: int) -> slice:
+        return slice(1, batch_size + 1)
 
-    def setup_prefetched_state(self, forward_batch: ForwardBatch) -> None:
-        cache_indices = self._cache_indices(forward_batch.req_pool_indices)
-        for conv_idx, conv_states in enumerate(self.req_pool.mamba2_layer_cache(self.layer_id).conv):
-            conv_states.zero_()
-            conv_states[:, :] = self.host_conv[conv_idx][:, : conv_states.shape[1]].to(
-                conv_states.device, non_blocking=True
-            )
-        temporal = self.req_pool.mamba2_layer_cache(self.layer_id).temporal
-        temporal.zero_()
-        temporal[:, :] = self.host_temporal[:, : temporal.shape[1]].to(
-            temporal.device, non_blocking=True
-        )
-        _ = cache_indices
-
-    def setup_zero_state(self) -> None:
+    def zero_state_slots(self, batch_size: int) -> None:
         layer_cache = self.req_pool.mamba2_layer_cache(self.layer_id)
         for conv_states in layer_cache.conv:
-            conv_states.zero_()
-        layer_cache.temporal.zero_()
+            conv_states[self._slot_slice(batch_size)].zero_()
+        layer_cache.temporal[self._slot_slice(batch_size)].zero_()
 
-    def bench_current(
+    def load_state_to_gpu(self, batch_size: int) -> None:
+        slot_slice = self._slot_slice(batch_size)
+        layer_cache = self.req_pool.mamba2_layer_cache(self.layer_id)
+        for conv_idx, conv_states in enumerate(layer_cache.conv):
+            conv_states[slot_slice].copy_(
+                self.host_conv[conv_idx][slot_slice],
+                non_blocking=True,
+            )
+        layer_cache.temporal[slot_slice].copy_(
+            self.host_temporal[slot_slice],
+            non_blocking=True,
+        )
+
+    def bench_full_forward(
+        self,
+        batch_size: int,
+        seq_len: int,
+        prefix_len: int,
+        *,
+        warmup_iters: int,
+        bench_iters: int,
+    ) -> dict[str, float]:
+        total_len = prefix_len + seq_len
+        hidden_states = self.make_hidden_states(batch_size * total_len)
+        forward_batch = self.make_forward_batch(batch_size, total_len, 0)
+        self.backend.init_forward_metadata(forward_batch)
+
+        def run():
+            self.block(hidden_states, None, forward_batch)
+
+        return benchmark_cuda_op_with_setup(
+            run,
+            warmup_iters=warmup_iters,
+            bench_iters=bench_iters,
+            setup_fn=lambda: self.zero_state_slots(batch_size),
+        )
+
+    def bench_reuse_cache_compute(
         self,
         batch_size: int,
         seq_len: int,
@@ -467,32 +492,47 @@ class LinearBlockBench:
         def run():
             self.block(hidden_states, None, forward_batch)
 
-        setup = self.setup_zero_state if prefix_len == 0 else lambda: self.setup_prefetched_state(forward_batch)
-        return benchmark_cuda_op_with_setup(
-            run, warmup_iters=warmup_iters, bench_iters=bench_iters, setup_fn=setup
+        setup = (
+            (lambda: self.zero_state_slots(batch_size))
+            if prefix_len == 0
+            else (lambda: self.load_state_to_gpu(batch_size))
         )
-
-    def bench_replay(
-        self,
-        batch_size: int,
-        total_len: int,
-        *,
-        warmup_iters: int,
-        bench_iters: int,
-    ) -> dict[str, float]:
-        hidden_states = self.make_hidden_states(batch_size * total_len)
-        forward_batch = self.make_forward_batch(batch_size, total_len, 0)
-        self.backend.init_forward_metadata(forward_batch)
-
-        def run():
-            self.block(hidden_states, None, forward_batch)
-
         return benchmark_cuda_op_with_setup(
             run,
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
-            setup_fn=self.setup_zero_state,
+            setup_fn=setup,
         )
+
+    def bench_state_load(
+        self,
+        batch_size: int,
+        prefix_len: int,
+        *,
+        warmup_iters: int,
+        bench_iters: int,
+    ) -> dict[str, float]:
+        if prefix_len == 0:
+            return {
+                "mean_ms": 0.0,
+                "median_ms": 0.0,
+                "p20_ms": 0.0,
+                "p80_ms": 0.0,
+                "min_ms": 0.0,
+                "max_ms": 0.0,
+            }
+
+        return benchmark_cuda_op_with_setup(
+            lambda: self.load_state_to_gpu(batch_size),
+            warmup_iters=warmup_iters,
+            bench_iters=bench_iters,
+            setup_fn=lambda: self.zero_state_slots(batch_size),
+        )
+
+    def state_bytes(self, batch_size: int, prefix_len: int) -> int:
+        if prefix_len == 0:
+            return 0
+        return int(self.cache_params.mamba_cache_per_req * batch_size)
 
 
 class FullBlockBench:
@@ -558,6 +598,14 @@ class FullBlockBench:
             pin_memory=True,
         )
         self.host_v = torch.randn_like(self.host_k)
+        self.stage_k = torch.empty(
+            max_batch_size * max_total_len,
+            config.num_key_value_heads,
+            config.head_dim,
+            dtype=dtype,
+            device="cuda",
+        )
+        self.stage_v = torch.empty_like(self.stage_k)
 
     def make_forward_batch(
         self, batch_size: int, seq_len: int, prefix_len: int
@@ -604,9 +652,11 @@ class FullBlockBench:
         base = torch.arange(prefix_len, prefix_len + seq_len, device="cuda", dtype=torch.int64)
         return base.repeat(batch_size)
 
-    def setup_prefix_kv(self, forward_batch: ForwardBatch, prefix_len: int) -> None:
+    def clear_prefix_kv(self) -> None:
         self.model_runner.token_to_kv_pool.k_buffer[0].zero_()
         self.model_runner.token_to_kv_pool.v_buffer[0].zero_()
+
+    def load_prefix_kv(self, forward_batch: ForwardBatch, prefix_len: int) -> None:
         if prefix_len == 0:
             return
         batch_size = forward_batch.batch_size
@@ -616,18 +666,43 @@ class FullBlockBench:
             .reshape(-1)
             .contiguous()
         )
-        cache_k = self.host_k[:token_count].to("cuda", non_blocking=True)
-        cache_v = self.host_v[:token_count].to("cuda", non_blocking=True)
+        self.stage_k[:token_count].copy_(self.host_k[:token_count], non_blocking=True)
+        self.stage_v[:token_count].copy_(self.host_v[:token_count], non_blocking=True)
         self.model_runner.token_to_kv_pool.set_kv_buffer(
             self.block.attn,
             loc,
-            cache_k,
-            cache_v,
+            self.stage_k[:token_count],
+            self.stage_v[:token_count],
             self.block.attn.k_scale,
             self.block.attn.v_scale,
         )
 
-    def bench_current(
+    def bench_full_forward(
+        self,
+        batch_size: int,
+        seq_len: int,
+        prefix_len: int,
+        *,
+        warmup_iters: int,
+        bench_iters: int,
+    ) -> dict[str, float]:
+        total_len = prefix_len + seq_len
+        hidden_states = self.make_hidden_states(batch_size * total_len)
+        positions = self.make_positions(batch_size, total_len, 0)
+        forward_batch = self.make_forward_batch(batch_size, total_len, 0)
+        self.backend.init_forward_metadata(forward_batch)
+
+        def run():
+            self.block(positions, hidden_states, None, forward_batch)
+
+        return benchmark_cuda_op_with_setup(
+            run,
+            warmup_iters=warmup_iters,
+            bench_iters=bench_iters,
+            setup_fn=self.clear_prefix_kv,
+        )
+
+    def bench_reuse_cache_compute(
         self,
         batch_size: int,
         seq_len: int,
@@ -644,35 +719,58 @@ class FullBlockBench:
         def run():
             self.block(positions, hidden_states, None, forward_batch)
 
+        setup = (
+            self.clear_prefix_kv
+            if prefix_len == 0
+            else lambda: self.load_prefix_kv(forward_batch, prefix_len)
+        )
         return benchmark_cuda_op_with_setup(
             run,
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
-            setup_fn=lambda: self.setup_prefix_kv(forward_batch, prefix_len),
+            setup_fn=setup,
         )
 
-    def bench_replay(
+    def bench_kv_load(
         self,
         batch_size: int,
-        total_len: int,
+        seq_len: int,
+        prefix_len: int,
         *,
         warmup_iters: int,
         bench_iters: int,
     ) -> dict[str, float]:
-        hidden_states = self.make_hidden_states(batch_size * total_len)
-        positions = self.make_positions(batch_size, total_len, 0)
-        forward_batch = self.make_forward_batch(batch_size, total_len, 0)
-        self.backend.init_forward_metadata(forward_batch)
+        if prefix_len == 0:
+            return {
+                "mean_ms": 0.0,
+                "median_ms": 0.0,
+                "p20_ms": 0.0,
+                "p80_ms": 0.0,
+                "min_ms": 0.0,
+                "max_ms": 0.0,
+            }
 
-        def run():
-            self.block(positions, hidden_states, None, forward_batch)
-
+        forward_batch = self.make_forward_batch(batch_size, seq_len, prefix_len)
         return benchmark_cuda_op_with_setup(
-            run,
+            lambda: self.load_prefix_kv(forward_batch, prefix_len),
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
-            setup_fn=lambda: self.setup_prefix_kv(forward_batch, 0),
+            setup_fn=self.clear_prefix_kv,
         )
+
+    def kv_bytes(self, batch_size: int, prefix_len: int) -> int:
+        if prefix_len == 0:
+            return 0
+        token_count = batch_size * prefix_len
+        k_bytes = nbytes_of_shape(
+            (token_count, self.config.num_key_value_heads, self.config.head_dim),
+            self.dtype,
+        )
+        v_bytes = nbytes_of_shape(
+            (token_count, self.config.num_key_value_heads, self.config.head_dim),
+            self.dtype,
+        )
+        return int(k_bytes + v_bytes)
 
 
 def run_block_forward_benchmarks(
@@ -703,30 +801,45 @@ def run_block_forward_benchmarks(
     for batch_size in args.batch_sizes:
         for seq_len in args.seq_lens:
             for prefix_len in args.prefix_lens:
-                replay_total_len = prefix_len + seq_len
-                linear_current_stats = linear_bench.bench_current(
+                total_len = prefix_len + seq_len
+                linear_full_forward_stats = linear_bench.bench_full_forward(
                     batch_size,
                     seq_len,
                     prefix_len,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
                 )
-                linear_replay_stats = linear_bench.bench_replay(
-                    batch_size,
-                    replay_total_len,
-                    warmup_iters=args.warmup_iters,
-                    bench_iters=args.bench_iters,
-                )
-                full_current_stats = full_bench.bench_current(
+                linear_reuse_stats = linear_bench.bench_reuse_cache_compute(
                     batch_size,
                     seq_len,
                     prefix_len,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
                 )
-                full_replay_stats = full_bench.bench_replay(
+                linear_state_load_stats = linear_bench.bench_state_load(
                     batch_size,
-                    replay_total_len,
+                    prefix_len,
+                    warmup_iters=args.warmup_iters,
+                    bench_iters=args.bench_iters,
+                )
+                full_full_forward_stats = full_bench.bench_full_forward(
+                    batch_size,
+                    seq_len,
+                    prefix_len,
+                    warmup_iters=args.warmup_iters,
+                    bench_iters=args.bench_iters,
+                )
+                full_reuse_stats = full_bench.bench_reuse_cache_compute(
+                    batch_size,
+                    seq_len,
+                    prefix_len,
+                    warmup_iters=args.warmup_iters,
+                    bench_iters=args.bench_iters,
+                )
+                full_kv_load_stats = full_bench.bench_kv_load(
+                    batch_size,
+                    seq_len,
+                    prefix_len,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
                 )
@@ -737,42 +850,74 @@ def run_block_forward_benchmarks(
                     batch_size=batch_size,
                     seq_len=seq_len,
                     prefix_len=prefix_len,
-                    replay_total_len=replay_total_len,
+                    total_len=total_len,
                 )
                 full_shape = full_block_shape_info(
                     config,
                     batch_size=batch_size,
                     seq_len=seq_len,
                     prefix_len=prefix_len,
-                    replay_total_len=replay_total_len,
+                    total_len=total_len,
                 )
                 payload = {
                     "batch_size": batch_size,
                     "seq_len": seq_len,
                     "prefix_len": prefix_len,
-                    "replay_total_len": replay_total_len,
+                    "total_len": total_len,
                 }
+                linear_state_bytes = linear_bench.state_bytes(batch_size, prefix_len)
+                full_kv_bytes = full_bench.kv_bytes(batch_size, prefix_len)
                 add_row(
                     rows,
-                    category="linear_block_extend_current",
-                    stats=linear_current_stats,
+                    category="linear_block_full_forward",
+                    stats=linear_full_forward_stats,
                     payload={**payload, "layer_id": linear_layer_id, "shape_info": linear_shape},
                 )
                 add_row(
                     rows,
-                    category="linear_block_extend_replay",
-                    stats=linear_replay_stats,
+                    category="linear_block_reuse_cache_compute",
+                    stats=linear_reuse_stats,
                     payload={**payload, "layer_id": linear_layer_id, "shape_info": linear_shape},
                 )
                 add_row(
                     rows,
-                    category="full_block_extend_current",
-                    stats=full_current_stats,
+                    category="linear_state_cache_h2d",
+                    stats=linear_state_load_stats,
+                    payload={
+                        **payload,
+                        "layer_id": linear_layer_id,
+                        "shape_info": linear_shape,
+                        "bytes": linear_state_bytes,
+                        "bytes_gb": format_gb(linear_state_bytes),
+                        "gbps": gbps(linear_state_bytes, linear_state_load_stats["median_ms"])
+                        if linear_state_load_stats["median_ms"] > 0
+                        else 0.0,
+                    },
+                )
+                add_row(
+                    rows,
+                    category="full_block_full_forward",
+                    stats=full_full_forward_stats,
                     payload={**payload, "layer_id": full_layer_id, "shape_info": full_shape},
                 )
                 add_row(
                     rows,
-                    category="full_block_extend_replay",
-                    stats=full_replay_stats,
+                    category="full_block_reuse_cache_compute",
+                    stats=full_reuse_stats,
                     payload={**payload, "layer_id": full_layer_id, "shape_info": full_shape},
+                )
+                add_row(
+                    rows,
+                    category="full_kvcache_h2d",
+                    stats=full_kv_load_stats,
+                    payload={
+                        **payload,
+                        "layer_id": full_layer_id,
+                        "shape_info": full_shape,
+                        "bytes": full_kv_bytes,
+                        "bytes_gb": format_gb(full_kv_bytes),
+                        "gbps": gbps(full_kv_bytes, full_kv_load_stats["median_ms"])
+                        if full_kv_load_stats["median_ms"] > 0
+                        else 0.0,
+                    },
                 )

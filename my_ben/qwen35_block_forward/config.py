@@ -4,6 +4,21 @@ import argparse
 from pathlib import Path
 
 from my_ben.qwen35_hybrid_recovery.config import (
+    DEFAULT_QWEN35_FIRST_FULL_LAYER_ID,
+    DEFAULT_QWEN35_FIRST_LINEAR_LAYER_ID,
+    DEFAULT_QWEN35_FULL_ATTENTION_INTERVAL,
+    DEFAULT_QWEN35_HEAD_DIM,
+    DEFAULT_QWEN35_LAYER_TYPES,
+    DEFAULT_QWEN35_LINEAR_CONV_KERNEL_DIM,
+    DEFAULT_QWEN35_LINEAR_KEY_HEAD_DIM,
+    DEFAULT_QWEN35_LINEAR_NUM_KEY_HEADS,
+    DEFAULT_QWEN35_LINEAR_NUM_VALUE_HEADS,
+    DEFAULT_QWEN35_LINEAR_VALUE_HEAD_DIM,
+    DEFAULT_QWEN35_MAMBA_SSM_DTYPE,
+    DEFAULT_QWEN35_MODEL_DTYPE,
+    DEFAULT_QWEN35_NUM_ATTENTION_HEADS,
+    DEFAULT_QWEN35_NUM_HIDDEN_LAYERS,
+    DEFAULT_QWEN35_NUM_KEY_VALUE_HEADS,
     apply_model_config_overrides,
     build_local_mamba_cache_params,
     derive_layer_ids,
@@ -30,28 +45,48 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16])
     parser.add_argument("--seq-lens", type=int, nargs="+", default=[128, 512, 2048])
     parser.add_argument("--prefix-lens", type=int, nargs="+", default=[0, 4096])
-    parser.add_argument("--linear-layer-id", type=int, default=None)
-    parser.add_argument("--full-layer-id", type=int, default=None)
+    parser.add_argument("--linear-layer-id", type=int, default=DEFAULT_QWEN35_FIRST_LINEAR_LAYER_ID)
+    parser.add_argument("--full-layer-id", type=int, default=DEFAULT_QWEN35_FIRST_FULL_LAYER_ID)
 
     hybrid_parser = _unused_hybrid_parse_args  # keep import usage explicit
     del hybrid_parser
 
     # Model override args kept aligned with qwen35_hybrid_recovery.
-    parser.add_argument("--num-hidden-layers", type=int, default=None)
-    parser.add_argument("--num-attention-heads", type=int, default=None)
-    parser.add_argument("--num-key-value-heads", type=int, default=None)
-    parser.add_argument("--head-dim", type=int, default=None)
-    parser.add_argument("--full-attention-interval", type=int, default=None)
-    parser.add_argument("--layer-types", type=str, nargs="+", default=None)
-    parser.add_argument("--linear-conv-kernel-dim", type=int, default=None)
-    parser.add_argument("--linear-num-key-heads", type=int, default=None)
-    parser.add_argument("--linear-num-value-heads", type=int, default=None)
-    parser.add_argument("--linear-key-head-dim", type=int, default=None)
-    parser.add_argument("--linear-value-head-dim", type=int, default=None)
+    parser.add_argument(
+        "--num-hidden-layers", type=int, default=DEFAULT_QWEN35_NUM_HIDDEN_LAYERS
+    )
+    parser.add_argument(
+        "--num-attention-heads", type=int, default=DEFAULT_QWEN35_NUM_ATTENTION_HEADS
+    )
+    parser.add_argument(
+        "--num-key-value-heads", type=int, default=DEFAULT_QWEN35_NUM_KEY_VALUE_HEADS
+    )
+    parser.add_argument("--head-dim", type=int, default=DEFAULT_QWEN35_HEAD_DIM)
+    parser.add_argument(
+        "--full-attention-interval",
+        type=int,
+        default=DEFAULT_QWEN35_FULL_ATTENTION_INTERVAL,
+    )
+    parser.add_argument("--layer-types", type=str, nargs="+", default=DEFAULT_QWEN35_LAYER_TYPES)
+    parser.add_argument(
+        "--linear-conv-kernel-dim", type=int, default=DEFAULT_QWEN35_LINEAR_CONV_KERNEL_DIM
+    )
+    parser.add_argument(
+        "--linear-num-key-heads", type=int, default=DEFAULT_QWEN35_LINEAR_NUM_KEY_HEADS
+    )
+    parser.add_argument(
+        "--linear-num-value-heads", type=int, default=DEFAULT_QWEN35_LINEAR_NUM_VALUE_HEADS
+    )
+    parser.add_argument(
+        "--linear-key-head-dim", type=int, default=DEFAULT_QWEN35_LINEAR_KEY_HEAD_DIM
+    )
+    parser.add_argument(
+        "--linear-value-head-dim", type=int, default=DEFAULT_QWEN35_LINEAR_VALUE_HEAD_DIM
+    )
     parser.add_argument(
         "--model-dtype",
         choices=["float16", "bfloat16", "float32"],
-        default=None,
+        default=DEFAULT_QWEN35_MODEL_DTYPE,
     )
     parser.add_argument(
         "--mamba-conv-dtype",
@@ -61,7 +96,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument(
         "--mamba-ssm-dtype",
         choices=["float16", "bfloat16", "float32"],
-        default=None,
+        default=DEFAULT_QWEN35_MAMBA_SSM_DTYPE,
     )
     parser.add_argument(
         "--linear-attn-backend",
