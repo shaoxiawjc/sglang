@@ -461,13 +461,21 @@ class LinearBlockBench:
         warmup_iters: int,
         bench_iters: int,
     ) -> dict[str, float]:
-        total_len = prefix_len + seq_len
-        hidden_states = self.make_hidden_states(batch_size * total_len)
-        forward_batch = self.make_forward_batch(batch_size, total_len, 0)
-        self.backend.init_forward_metadata(forward_batch)
+        prefix_hidden_states = (
+            self.make_hidden_states(batch_size * prefix_len) if prefix_len > 0 else None
+        )
+        current_hidden_states = self.make_hidden_states(batch_size * seq_len)
+        prefix_forward_batch = (
+            self.make_forward_batch(batch_size, prefix_len, 0) if prefix_len > 0 else None
+        )
+        current_forward_batch = self.make_forward_batch(batch_size, seq_len, prefix_len)
 
         def run():
-            self.block(hidden_states, None, forward_batch)
+            if prefix_forward_batch is not None and prefix_hidden_states is not None:
+                self.backend.init_forward_metadata(prefix_forward_batch)
+                self.block(prefix_hidden_states, None, prefix_forward_batch)
+            self.backend.init_forward_metadata(current_forward_batch)
+            self.block(current_hidden_states, None, current_forward_batch)
 
         return benchmark_cuda_op_with_setup(
             run,
@@ -487,9 +495,9 @@ class LinearBlockBench:
     ) -> dict[str, float]:
         hidden_states = self.make_hidden_states(batch_size * seq_len)
         forward_batch = self.make_forward_batch(batch_size, seq_len, prefix_len)
-        self.backend.init_forward_metadata(forward_batch)
 
         def run():
+            self.backend.init_forward_metadata(forward_batch)
             self.block(hidden_states, None, forward_batch)
 
         setup = (
@@ -686,14 +694,39 @@ class FullBlockBench:
         warmup_iters: int,
         bench_iters: int,
     ) -> dict[str, float]:
-        total_len = prefix_len + seq_len
-        hidden_states = self.make_hidden_states(batch_size * total_len)
-        positions = self.make_positions(batch_size, total_len, 0)
-        forward_batch = self.make_forward_batch(batch_size, total_len, 0)
-        self.backend.init_forward_metadata(forward_batch)
+        prefix_hidden_states = (
+            self.make_hidden_states(batch_size * prefix_len) if prefix_len > 0 else None
+        )
+        prefix_positions = (
+            self.make_positions(batch_size, prefix_len, 0) if prefix_len > 0 else None
+        )
+        prefix_forward_batch = (
+            self.make_forward_batch(batch_size, prefix_len, 0) if prefix_len > 0 else None
+        )
+        current_hidden_states = self.make_hidden_states(batch_size * seq_len)
+        current_positions = self.make_positions(batch_size, seq_len, prefix_len)
+        current_forward_batch = self.make_forward_batch(batch_size, seq_len, prefix_len)
 
         def run():
-            self.block(positions, hidden_states, None, forward_batch)
+            if (
+                prefix_forward_batch is not None
+                and prefix_hidden_states is not None
+                and prefix_positions is not None
+            ):
+                self.backend.init_forward_metadata(prefix_forward_batch)
+                self.block(
+                    prefix_positions,
+                    prefix_hidden_states,
+                    None,
+                    prefix_forward_batch,
+                )
+            self.backend.init_forward_metadata(current_forward_batch)
+            self.block(
+                current_positions,
+                current_hidden_states,
+                None,
+                current_forward_batch,
+            )
 
         return benchmark_cuda_op_with_setup(
             run,
@@ -714,9 +747,9 @@ class FullBlockBench:
         hidden_states = self.make_hidden_states(batch_size * seq_len)
         positions = self.make_positions(batch_size, seq_len, prefix_len)
         forward_batch = self.make_forward_batch(batch_size, seq_len, prefix_len)
-        self.backend.init_forward_metadata(forward_batch)
 
         def run():
+            self.backend.init_forward_metadata(forward_batch)
             self.block(positions, hidden_states, None, forward_batch)
 
         setup = (
