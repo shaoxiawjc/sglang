@@ -24,6 +24,12 @@ CATEGORY_PLOT_SPECS = {
         "series_keys": tuple(),
         "xlabel": "batch size",
     },
+    "linear_attention_state_update": {
+        "title": "Linear Attention State Update",
+        "x_key": "seq_len",
+        "series_keys": ("batch_size", "prefix_len"),
+        "xlabel": "seq len",
+    },
     "full_block_full_forward": {
         "title": "Full Block Full Forward",
         "x_key": "seq_len",
@@ -41,6 +47,12 @@ CATEGORY_PLOT_SPECS = {
         "x_key": "prefix_len",
         "series_keys": ("batch_size",),
         "xlabel": "prefix len",
+    },
+    "full_attention_softmax_qkv": {
+        "title": "Full Attention Softmax(QK)V",
+        "x_key": "seq_len",
+        "series_keys": ("batch_size", "prefix_len"),
+        "xlabel": "seq len",
     },
 }
 

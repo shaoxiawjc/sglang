@@ -30,11 +30,14 @@ def linear_block_shape_info(
         "hidden_shape_reuse": shape_list(current_tokens, config.hidden_size),
         "mixed_qkv_shape_full_forward": shape_list(total_tokens, key_dim * 2 + value_dim),
         "mixed_qkv_shape_reuse": shape_list(current_tokens, key_dim * 2 + value_dim),
+        "mixed_qkv_shape_state_update": shape_list(current_tokens, key_dim * 2 + value_dim),
         "z_shape_reuse": shape_list(
             current_tokens, config.linear_num_value_heads, config.linear_value_head_dim
         ),
         "a_shape_reuse": shape_list(current_tokens, config.linear_num_value_heads),
         "b_shape_reuse": shape_list(current_tokens, config.linear_num_value_heads),
+        "a_shape_state_update": shape_list(current_tokens, config.linear_num_value_heads),
+        "b_shape_state_update": shape_list(current_tokens, config.linear_num_value_heads),
         "state_conv_shape_per_request": [
             shape_list(1, batch_size, *conv_shape) for conv_shape in cache_params.shape.conv
         ],
@@ -68,6 +71,15 @@ def full_block_shape_info(
             current_tokens, config.num_key_value_heads, config.head_dim
         ),
         "v_shape_reuse": shape_list(
+            current_tokens, config.num_key_value_heads, config.head_dim
+        ),
+        "q_shape_attention_compute": shape_list(
+            current_tokens, config.num_attention_heads, config.head_dim
+        ),
+        "k_shape_attention_compute": shape_list(
+            current_tokens, config.num_key_value_heads, config.head_dim
+        ),
+        "v_shape_attention_compute": shape_list(
             current_tokens, config.num_key_value_heads, config.head_dim
         ),
         "prefix_kv_shape": shape_list(

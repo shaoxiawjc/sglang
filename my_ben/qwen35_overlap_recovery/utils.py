@@ -6,15 +6,12 @@ from pathlib import Path
 
 from my_ben.qwen35_hybrid_recovery.utils import make_jsonable
 
+
 CATEGORY_DIRS = {
-    "linear_block_full_forward": "linear_block_full_forward",
-    "linear_block_reuse_cache_compute": "linear_block_reuse_cache_compute",
-    "linear_state_cache_h2d": "linear_state_cache_h2d",
-    "linear_attention_state_update": "linear_attention_state_update",
-    "full_block_full_forward": "full_block_full_forward",
-    "full_block_reuse_cache_compute": "full_block_reuse_cache_compute",
-    "full_kvcache_h2d": "full_kvcache_h2d",
-    "full_attention_softmax_qkv": "full_attention_softmax_qkv",
+    "baseline_recompute": "baseline_recompute",
+    "baseline_offload_onload": "baseline_offload_onload",
+    "ours_ca_recompute_overlap_la_state_conv": "ours_ca_recompute_overlap_la_state_conv",
+    "ours_la_recompute_overlap_ca_kvcache": "ours_la_recompute_overlap_ca_kvcache",
 }
 
 
@@ -29,7 +26,7 @@ def _write_rows_json_csv(output_dir: Path, rows: list[dict[str, object]]) -> Non
         writer.writerows(rows)
 
 
-def write_block_outputs(
+def write_overlap_outputs(
     output_dir: Path,
     *,
     rows: list[dict[str, object]],
@@ -42,17 +39,10 @@ def write_block_outputs(
     )
 
     groups = {
-        "linear_block_forward": [
-            "linear_block_full_forward",
-            "linear_block_reuse_cache_compute",
-            "linear_state_cache_h2d",
-            "linear_attention_state_update",
-        ],
-        "full_block_forward": [
-            "full_block_full_forward",
-            "full_block_reuse_cache_compute",
-            "full_kvcache_h2d",
-            "full_attention_softmax_qkv",
+        "baseline": ["baseline_recompute", "baseline_offload_onload"],
+        "ours": [
+            "ours_ca_recompute_overlap_la_state_conv",
+            "ours_la_recompute_overlap_ca_kvcache",
         ],
     }
     for group_name, categories in groups.items():

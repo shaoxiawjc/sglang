@@ -1,3 +1,1 @@
-from .main import main
-
-__all__ = ["main"]
+"""Overlap recovery benchmarks built on qwen35_block_forward blocks."""

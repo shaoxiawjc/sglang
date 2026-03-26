@@ -512,6 +512,43 @@ class LinearBlockBench:
             setup_fn=setup,
         )
 
+    def bench_attention_state_update(
+        self,
+        batch_size: int,
+        seq_len: int,
+        prefix_len: int,
+        *,
+        warmup_iters: int,
+        bench_iters: int,
+    ) -> dict[str, float]:
+        hidden_states = self.make_hidden_states(batch_size * seq_len)
+        forward_batch = self.make_forward_batch(batch_size, seq_len, prefix_len)
+        mixed_qkv, _ = self.block.linear_attn.in_proj_qkv(hidden_states)
+        a, _ = self.block.linear_attn.in_proj_a(hidden_states)
+        b, _ = self.block.linear_attn.in_proj_b(hidden_states)
+
+        def run():
+            self.backend.init_forward_metadata(forward_batch)
+            self.backend.forward_extend(
+                self.block.linear_attn.attn,
+                forward_batch,
+                mixed_qkv,
+                a,
+                b,
+            )
+
+        setup = (
+            (lambda: self.zero_state_slots(batch_size))
+            if prefix_len == 0
+            else (lambda: self.load_state_to_gpu(batch_size))
+        )
+        return benchmark_cuda_op_with_setup(
+            run,
+            warmup_iters=warmup_iters,
+            bench_iters=bench_iters,
+            setup_fn=setup,
+        )
+
     def bench_state_load(
         self,
         batch_size: int,
@@ -694,38 +731,18 @@ class FullBlockBench:
         warmup_iters: int,
         bench_iters: int,
     ) -> dict[str, float]:
-        prefix_hidden_states = (
-            self.make_hidden_states(batch_size * prefix_len) if prefix_len > 0 else None
-        )
-        prefix_positions = (
-            self.make_positions(batch_size, prefix_len, 0) if prefix_len > 0 else None
-        )
-        prefix_forward_batch = (
-            self.make_forward_batch(batch_size, prefix_len, 0) if prefix_len > 0 else None
-        )
-        current_hidden_states = self.make_hidden_states(batch_size * seq_len)
-        current_positions = self.make_positions(batch_size, seq_len, prefix_len)
-        current_forward_batch = self.make_forward_batch(batch_size, seq_len, prefix_len)
+        total_len = prefix_len + seq_len
+        total_hidden_states = self.make_hidden_states(batch_size * total_len)
+        total_positions = self.make_positions(batch_size, total_len, 0)
+        total_forward_batch = self.make_forward_batch(batch_size, total_len, 0)
 
         def run():
-            if (
-                prefix_forward_batch is not None
-                and prefix_hidden_states is not None
-                and prefix_positions is not None
-            ):
-                self.backend.init_forward_metadata(prefix_forward_batch)
-                self.block(
-                    prefix_positions,
-                    prefix_hidden_states,
-                    None,
-                    prefix_forward_batch,
-                )
-            self.backend.init_forward_metadata(current_forward_batch)
+            self.backend.init_forward_metadata(total_forward_batch)
             self.block(
-                current_positions,
-                current_hidden_states,
+                total_positions,
+                total_hidden_states,
                 None,
-                current_forward_batch,
+                total_forward_batch,
             )
 
         return benchmark_cuda_op_with_setup(
@@ -751,6 +768,50 @@ class FullBlockBench:
         def run():
             self.backend.init_forward_metadata(forward_batch)
             self.block(positions, hidden_states, None, forward_batch)
+
+        setup = (
+            self.clear_prefix_kv
+            if prefix_len == 0
+            else lambda: self.load_prefix_kv(forward_batch, prefix_len)
+        )
+        return benchmark_cuda_op_with_setup(
+            run,
+            warmup_iters=warmup_iters,
+            bench_iters=bench_iters,
+            setup_fn=setup,
+        )
+
+    def bench_attention_compute(
+        self,
+        batch_size: int,
+        seq_len: int,
+        prefix_len: int,
+        *,
+        warmup_iters: int,
+        bench_iters: int,
+    ) -> dict[str, float]:
+        hidden_states = self.make_hidden_states(batch_size * seq_len)
+        positions = self.make_positions(batch_size, seq_len, prefix_len)
+        forward_batch = self.make_forward_batch(batch_size, seq_len, prefix_len)
+        qkv, _ = self.block.qkv_proj(hidden_states)
+        if self.block.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.block.q_size * 2, self.block.kv_size, self.block.kv_size], dim=-1
+            )
+            q_gate = q_gate.view(*q_gate.shape[:-1], self.block.num_heads, -1)
+            q, _gate = torch.chunk(q_gate, 2, dim=-1)
+            q = q.reshape(*q_gate.shape[:-2], -1)
+        else:
+            q, k, v = qkv.split(
+                [self.block.q_size, self.block.kv_size, self.block.kv_size], dim=-1
+            )
+        q_by_head = self.block.q_norm(q.reshape(-1, self.block.head_dim)).view(q.shape)
+        k_by_head = self.block.k_norm(k.reshape(-1, self.block.head_dim)).view(k.shape)
+        q_ready, k_ready = self.block.rotary_emb(positions, q_by_head, k_by_head)
+
+        def run():
+            self.backend.init_forward_metadata(forward_batch)
+            self.block.attn(q_ready, k_ready, v, forward_batch)
 
         setup = (
             self.clear_prefix_kv
@@ -855,6 +916,13 @@ def run_block_forward_benchmarks(
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
                 )
+                linear_state_update_stats = linear_bench.bench_attention_state_update(
+                    batch_size,
+                    seq_len,
+                    prefix_len,
+                    warmup_iters=args.warmup_iters,
+                    bench_iters=args.bench_iters,
+                )
                 full_full_forward_stats = full_bench.bench_full_forward(
                     batch_size,
                     seq_len,
@@ -870,6 +938,13 @@ def run_block_forward_benchmarks(
                     bench_iters=args.bench_iters,
                 )
                 full_kv_load_stats = full_bench.bench_kv_load(
+                    batch_size,
+                    seq_len,
+                    prefix_len,
+                    warmup_iters=args.warmup_iters,
+                    bench_iters=args.bench_iters,
+                )
+                full_attention_compute_stats = full_bench.bench_attention_compute(
                     batch_size,
                     seq_len,
                     prefix_len,
@@ -929,6 +1004,12 @@ def run_block_forward_benchmarks(
                 )
                 add_row(
                     rows,
+                    category="linear_attention_state_update",
+                    stats=linear_state_update_stats,
+                    payload={**payload, "layer_id": linear_layer_id, "shape_info": linear_shape},
+                )
+                add_row(
+                    rows,
                     category="full_block_full_forward",
                     stats=full_full_forward_stats,
                     payload={**payload, "layer_id": full_layer_id, "shape_info": full_shape},
@@ -953,4 +1034,10 @@ def run_block_forward_benchmarks(
                         if full_kv_load_stats["median_ms"] > 0
                         else 0.0,
                     },
+                )
+                add_row(
+                    rows,
+                    category="full_attention_softmax_qkv",
+                    stats=full_attention_compute_stats,
+                    payload={**payload, "layer_id": full_layer_id, "shape_info": full_shape},
                 )

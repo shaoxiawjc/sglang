@@ -13,61 +13,38 @@ os.environ.setdefault(
 sys.path.insert(0, str(REPO_ROOT / "python"))
 sys.path.insert(0, str(REPO_ROOT))
 
-from my_ben.qwen35_hybrid_recovery.utils import now_stamp, write_outputs
+from my_ben.qwen35_hybrid_recovery.utils import now_stamp
 from sglang.srt.layers.attention.linear.utils import initialize_linear_attn_config
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 from .benches import run_overlap_benchmarks
-from .config import (
-    apply_model_config_overrides,
-    build_local_mamba_cache_params,
-    build_subset_mamba_cache_params,
-    derive_layer_ids,
-    load_text_config,
-    normalize_recompute_counts,
-    parse_args,
-    resolve_mamba_state_dtype,
-    select_recovery_layers,
-)
+from .config import parse_args, resolve_model_and_group
 from .metadata import build_metadata
 from .plotting import generate_plots
+from .utils import write_overlap_outputs
 
 
 def main() -> None:
     args = parse_args(REPO_ROOT)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark.")
+
     server_args = ServerArgs(model_path="dummy")
     server_args.linear_attn_backend = args.linear_attn_backend
     server_args.linear_attn_decode_backend = args.linear_attn_decode_backend
     server_args.linear_attn_prefill_backend = args.linear_attn_prefill_backend
+    set_global_server_args_for_scheduler(server_args)
     initialize_linear_attn_config(server_args)
 
-    config, model_dtype, raw_config = load_text_config(args.model_path)
-    config, model_dtype, raw_config = apply_model_config_overrides(
-        args, config, model_dtype, raw_config
-    )
-    linear_layer_ids, full_layer_ids = derive_layer_ids(raw_config)
-    target_linear_layer_ids, target_full_layer_ids = select_recovery_layers(
-        linear_layer_ids,
-        full_layer_ids,
-        group_index=args.group_index,
-        linear_layer_count=args.linear_layer_count,
-        full_layer_count=args.full_layer_count,
-        target_linear_layer_ids=args.target_linear_layer_ids,
-        target_full_layer_ids=args.target_full_layer_ids,
-    )
-    recompute_counts = normalize_recompute_counts(
-        args.linear_recompute_counts, len(target_linear_layer_ids)
-    )
-    full_mamba_cache_params = build_local_mamba_cache_params(
+    (
         config,
+        model_dtype,
+        raw_config,
         linear_layer_ids,
-        dtype_override=resolve_mamba_state_dtype(args, config),
-    )
-    target_cache_params = build_subset_mamba_cache_params(
-        full_mamba_cache_params, target_linear_layer_ids
-    )
+        causal_layer_id,
+        recompute_counts,
+        cache_params,
+    ) = resolve_model_and_group(args)
     config.torch_dtype = model_dtype
 
     rows: list[dict[str, object]] = []
@@ -79,9 +56,9 @@ def main() -> None:
         args=args,
         config=config,
         model_dtype=model_dtype,
-        linear_cache_params=target_cache_params,
-        target_linear_layer_ids=target_linear_layer_ids,
-        target_full_layer_ids=target_full_layer_ids,
+        linear_cache_params=cache_params,
+        linear_layer_ids=linear_layer_ids,
+        causal_layer_id=causal_layer_id,
         recompute_counts=recompute_counts,
     )
 
@@ -92,12 +69,12 @@ def main() -> None:
         config=config,
         model_dtype=model_dtype,
         raw_config=raw_config,
-        target_linear_layer_ids=target_linear_layer_ids,
-        target_full_layer_ids=target_full_layer_ids,
+        linear_layer_ids=linear_layer_ids,
+        causal_layer_id=causal_layer_id,
         recompute_counts=recompute_counts,
-        cache_params=target_cache_params,
+        cache_params=cache_params,
     )
-    write_outputs(output_dir, rows=rows, metadata=metadata)
+    write_overlap_outputs(output_dir, rows=rows, metadata=metadata)
     generate_plots(rows, output_dir)
 
     print(f"Saved benchmark results to {output_dir}")

@@ -10,65 +10,49 @@ def shape_list(*dims: int) -> list[int]:
     return [int(dim) for dim in dims]
 
 
-def overlap_shape_info(
+def strategy_shape_info(
     *,
     config: Qwen3_5TextConfig,
     cache_params: Mamba2CacheParams,
-    linear_layer_ids: list[int],
-    full_layer_ids: list[int],
     batch_size: int,
     seq_len: int,
     prefix_len: int,
+    linear_layer_count: int,
+    linear_recompute_count: int,
 ) -> dict[str, object]:
     total_len = prefix_len + seq_len
-    total_recompute_tokens = batch_size * total_len
+    total_tokens = batch_size * total_len
     current_tokens = batch_size * seq_len
     prefix_tokens = batch_size * prefix_len
+    linear_onload_count = linear_layer_count - linear_recompute_count
     return {
-        "linear_layer_ids": linear_layer_ids,
-        "full_layer_ids": full_layer_ids,
         "batch_size": batch_size,
         "seq_len": seq_len,
         "prefix_len": prefix_len,
-        "total_len_per_request": total_len,
-        "linear_layer_count": len(linear_layer_ids),
-        "full_layer_count": len(full_layer_ids),
-        "linear_recompute_tokens_total": total_recompute_tokens,
-        "linear_current_forward_tokens_total": current_tokens,
-        "full_recompute_tokens_total": total_recompute_tokens,
-        "full_prefix_prefetch_tokens_total": prefix_tokens * len(full_layer_ids),
-        "hidden_shape_recompute": shape_list(total_recompute_tokens, config.hidden_size),
-        "hidden_shape_current": shape_list(current_tokens, config.hidden_size),
-        "full_qkv_shape_recompute": {
-            "q": shape_list(
-                total_recompute_tokens, config.num_attention_heads, config.head_dim
-            ),
-            "k": shape_list(
-                total_recompute_tokens, config.num_key_value_heads, config.head_dim
-            ),
-            "v": shape_list(
-                total_recompute_tokens, config.num_key_value_heads, config.head_dim
-            ),
-        },
-        "full_qkv_shape_current": {
-            "q": shape_list(current_tokens, config.num_attention_heads, config.head_dim),
-            "k": shape_list(current_tokens, config.num_key_value_heads, config.head_dim),
-            "v": shape_list(current_tokens, config.num_key_value_heads, config.head_dim),
-        },
-        "full_prefix_kv_shape_per_layer": shape_list(
-            prefix_tokens, config.num_key_value_heads, config.head_dim
-        ),
-        "state_slot_count": batch_size,
-        "state_conv_shapes": [
-            shape_list(len(linear_layer_ids), batch_size, *conv_shape)
+        "total_len": total_len,
+        "linear_layer_count": linear_layer_count,
+        "linear_recompute_count": linear_recompute_count,
+        "linear_onload_count": linear_onload_count,
+        "causal_layer_count": 1,
+        "linear_full_hidden_shape": shape_list(total_tokens, config.hidden_size),
+        "linear_current_hidden_shape": shape_list(current_tokens, config.hidden_size),
+        "linear_state_conv_shapes": [
+            shape_list(linear_onload_count, batch_size, *conv_shape)
             for conv_shape in cache_params.shape.conv
         ],
-        "state_temporal_shape": shape_list(
-            len(linear_layer_ids), batch_size, *cache_params.shape.temporal
+        "linear_state_conv_dtype": dtype_name(cache_params.dtype.conv),
+        "linear_state_temporal_shape": shape_list(
+            linear_onload_count,
+            batch_size,
+            *cache_params.shape.temporal,
         ),
-        "state_conv_dtype": dtype_name(cache_params.dtype.conv),
-        "state_temporal_dtype": dtype_name(cache_params.dtype.temporal),
-        "full_kv_dtype": dtype_name(config.torch_dtype)
-        if hasattr(config, "torch_dtype")
-        else None,
+        "linear_state_temporal_dtype": dtype_name(cache_params.dtype.temporal),
+        "causal_full_hidden_shape": shape_list(total_tokens, config.hidden_size),
+        "causal_current_hidden_shape": shape_list(current_tokens, config.hidden_size),
+        "causal_prefix_k_shape": shape_list(
+            prefix_tokens, config.num_key_value_heads, config.head_dim
+        ),
+        "causal_prefix_v_shape": shape_list(
+            prefix_tokens, config.num_key_value_heads, config.head_dim
+        ),
     }

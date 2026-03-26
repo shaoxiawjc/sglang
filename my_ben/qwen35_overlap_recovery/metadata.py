@@ -1,62 +1,57 @@
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
 import torch
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams
-from sglang.srt.configs.qwen3_5 import Qwen3_5TextConfig
-
-from my_ben.qwen35_hybrid_recovery.utils import dtype_name, git_commit
+from my_ben.qwen35_hybrid_recovery.utils import git_commit, make_jsonable
 
 
 def build_metadata(
     *,
-    args: argparse.Namespace,
+    args,
     repo_root: Path,
     stamp: str,
-    config: Qwen3_5TextConfig,
+    config,
     model_dtype: torch.dtype,
     raw_config: dict,
-    target_linear_layer_ids: list[int],
-    target_full_layer_ids: list[int],
+    linear_layer_ids: list[int],
+    causal_layer_id: int,
     recompute_counts: list[int],
-    cache_params: Mamba2CacheParams,
-) -> dict[str, object]:
-    return {
-        "timestamp_utc": stamp,
-        "model_path": str(args.model_path),
-        "device_name": torch.cuda.get_device_name(0),
-        "cuda_device_count": torch.cuda.device_count(),
-        "torch_version": torch.__version__,
-        "cuda_version": torch.version.cuda,
-        "git_commit": git_commit(repo_root),
-        "model_dtype": dtype_name(model_dtype),
-        "target_group": {
-            "group_index": args.group_index,
-            "linear_layer_ids": target_linear_layer_ids,
-            "full_layer_ids": target_full_layer_ids,
-            "linear_layer_count": len(target_linear_layer_ids),
-            "full_layer_count": len(target_full_layer_ids),
-            "linear_recompute_counts": recompute_counts,
-        },
-        "config_summary": {
-            "hidden_size": config.hidden_size,
-            "num_hidden_layers": config.num_hidden_layers,
-            "num_attention_heads": config.num_attention_heads,
-            "num_key_value_heads": config.num_key_value_heads,
-            "head_dim": config.head_dim,
-            "linear_num_key_heads": config.linear_num_key_heads,
-            "linear_num_value_heads": config.linear_num_value_heads,
-            "linear_key_head_dim": config.linear_key_head_dim,
-            "linear_value_head_dim": config.linear_value_head_dim,
-            "linear_conv_kernel_dim": config.linear_conv_kernel_dim,
-            "mamba_state_dtype": {
-                "conv": dtype_name(cache_params.dtype.conv),
-                "temporal": dtype_name(cache_params.dtype.temporal),
+    cache_params,
+):
+    return make_jsonable(
+        {
+            "timestamp": stamp,
+            "git_commit": git_commit(repo_root),
+            "model_path": args.model_path,
+            "device_name": torch.cuda.get_device_name(0),
+            "cuda_device_count": torch.cuda.device_count(),
+            "torch_version": torch.__version__,
+            "cuda_version": torch.version.cuda,
+            "model_dtype": str(model_dtype),
+            "group_summary": {
+                "assumption": "3 linear-attention blocks : 1 causal-attention block",
+                "group_index": args.group_index,
+                "linear_layer_ids": linear_layer_ids,
+                "causal_layer_id": causal_layer_id,
+                "linear_recompute_counts": recompute_counts,
             },
-        },
-        "effective_text_config": raw_config["text_config"],
-        "benchmark_args": vars(args),
-    }
+            "args": vars(args),
+            "effective_text_config": config.to_dict(),
+            "raw_text_config": raw_config["text_config"],
+            "mamba_cache_params": {
+                "layers": cache_params.layers,
+                "conv_shapes": cache_params.shape.conv,
+                "temporal_shape": cache_params.shape.temporal,
+                "conv_dtype": str(cache_params.dtype.conv),
+                "temporal_dtype": str(cache_params.dtype.temporal),
+            },
+            "strategies": [
+                "baseline_recompute",
+                "baseline_offload_onload",
+                "ours_ca_recompute_overlap_la_state_conv",
+                "ours_la_recompute_overlap_ca_kvcache",
+            ],
+        }
+    )
