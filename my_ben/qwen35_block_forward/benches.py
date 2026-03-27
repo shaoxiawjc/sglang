@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 from types import SimpleNamespace
 
 import torch
@@ -37,6 +38,7 @@ def benchmark_cuda_op_with_setup(
     warmup_iters: int,
     bench_iters: int,
     setup_fn=None,
+    teardown_fn=None,
 ):
     if setup_fn is None:
         return benchmark_cuda_op(fn, warmup_iters=warmup_iters, bench_iters=bench_iters)
@@ -45,6 +47,9 @@ def benchmark_cuda_op_with_setup(
         setup_fn()
         torch.cuda.synchronize()
         fn()
+        torch.cuda.synchronize()
+        if teardown_fn is not None:
+            teardown_fn()
     torch.cuda.synchronize()
 
     times_ms: list[float] = []
@@ -58,6 +63,8 @@ def benchmark_cuda_op_with_setup(
         end.record()
         end.synchronize()
         times_ms.append(float(start.elapsed_time(end)))
+        if teardown_fn is not None:
+            teardown_fn()
     import numpy as np
 
     def percentile(values: list[float], q: float) -> float:
@@ -71,6 +78,14 @@ def benchmark_cuda_op_with_setup(
         "min_ms": float(np.min(times_ms)),
         "max_ms": float(np.max(times_ms)),
     }
+
+
+def release_cuda_memory() -> None:
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    if hasattr(torch.cuda, "ipc_collect"):
+        torch.cuda.ipc_collect()
 
 
 class LocalLinear(torch.nn.Module):
@@ -460,6 +475,7 @@ class LinearBlockBench:
         *,
         warmup_iters: int,
         bench_iters: int,
+        teardown_fn=None,
     ) -> dict[str, float]:
         prefix_hidden_states = (
             self.make_hidden_states(batch_size * prefix_len) if prefix_len > 0 else None
@@ -482,6 +498,7 @@ class LinearBlockBench:
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
             setup_fn=lambda: self.zero_state_slots(batch_size),
+            teardown_fn=teardown_fn,
         )
 
     def bench_reuse_cache_compute(
@@ -492,6 +509,7 @@ class LinearBlockBench:
         *,
         warmup_iters: int,
         bench_iters: int,
+        teardown_fn=None,
     ) -> dict[str, float]:
         hidden_states = self.make_hidden_states(batch_size * seq_len)
         forward_batch = self.make_forward_batch(batch_size, seq_len, prefix_len)
@@ -510,6 +528,7 @@ class LinearBlockBench:
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
             setup_fn=setup,
+            teardown_fn=teardown_fn,
         )
 
     def bench_attention_state_update(
@@ -520,6 +539,7 @@ class LinearBlockBench:
         *,
         warmup_iters: int,
         bench_iters: int,
+        teardown_fn=None,
     ) -> dict[str, float]:
         hidden_states = self.make_hidden_states(batch_size * seq_len)
         forward_batch = self.make_forward_batch(batch_size, seq_len, prefix_len)
@@ -547,6 +567,7 @@ class LinearBlockBench:
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
             setup_fn=setup,
+            teardown_fn=teardown_fn,
         )
 
     def bench_state_load(
@@ -556,6 +577,7 @@ class LinearBlockBench:
         *,
         warmup_iters: int,
         bench_iters: int,
+        teardown_fn=None,
     ) -> dict[str, float]:
         if prefix_len == 0:
             return {
@@ -572,6 +594,7 @@ class LinearBlockBench:
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
             setup_fn=lambda: self.zero_state_slots(batch_size),
+            teardown_fn=teardown_fn,
         )
 
     def state_bytes(self, batch_size: int, prefix_len: int) -> int:
@@ -730,6 +753,7 @@ class FullBlockBench:
         *,
         warmup_iters: int,
         bench_iters: int,
+        teardown_fn=None,
     ) -> dict[str, float]:
         total_len = prefix_len + seq_len
         total_hidden_states = self.make_hidden_states(batch_size * total_len)
@@ -750,6 +774,7 @@ class FullBlockBench:
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
             setup_fn=self.clear_prefix_kv,
+            teardown_fn=teardown_fn,
         )
 
     def bench_reuse_cache_compute(
@@ -760,6 +785,7 @@ class FullBlockBench:
         *,
         warmup_iters: int,
         bench_iters: int,
+        teardown_fn=None,
     ) -> dict[str, float]:
         hidden_states = self.make_hidden_states(batch_size * seq_len)
         positions = self.make_positions(batch_size, seq_len, prefix_len)
@@ -779,6 +805,7 @@ class FullBlockBench:
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
             setup_fn=setup,
+            teardown_fn=teardown_fn,
         )
 
     def bench_attention_compute(
@@ -789,6 +816,7 @@ class FullBlockBench:
         *,
         warmup_iters: int,
         bench_iters: int,
+        teardown_fn=None,
     ) -> dict[str, float]:
         hidden_states = self.make_hidden_states(batch_size * seq_len)
         positions = self.make_positions(batch_size, seq_len, prefix_len)
@@ -823,6 +851,7 @@ class FullBlockBench:
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
             setup_fn=setup,
+            teardown_fn=teardown_fn,
         )
 
     def bench_kv_load(
@@ -833,6 +862,7 @@ class FullBlockBench:
         *,
         warmup_iters: int,
         bench_iters: int,
+        teardown_fn=None,
     ) -> dict[str, float]:
         if prefix_len == 0:
             return {
@@ -850,6 +880,7 @@ class FullBlockBench:
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
             setup_fn=self.clear_prefix_kv,
+            teardown_fn=teardown_fn,
         )
 
     def kv_bytes(self, batch_size: int, prefix_len: int) -> int:
@@ -892,6 +923,7 @@ def run_block_forward_benchmarks(
         max_batch_size=max(args.batch_sizes),
         max_total_len=max(args.prefix_lens) + max(args.seq_lens),
     )
+    teardown_fn = release_cuda_memory if args.clear_cuda_cache_each_iter else None
     for batch_size in args.batch_sizes:
         for seq_len in args.seq_lens:
             for prefix_len in args.prefix_lens:
@@ -902,6 +934,7 @@ def run_block_forward_benchmarks(
                     prefix_len,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
+                    teardown_fn=teardown_fn,
                 )
                 linear_reuse_stats = linear_bench.bench_reuse_cache_compute(
                     batch_size,
@@ -909,12 +942,14 @@ def run_block_forward_benchmarks(
                     prefix_len,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
+                    teardown_fn=teardown_fn,
                 )
                 linear_state_load_stats = linear_bench.bench_state_load(
                     batch_size,
                     prefix_len,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
+                    teardown_fn=teardown_fn,
                 )
                 linear_state_update_stats = linear_bench.bench_attention_state_update(
                     batch_size,
@@ -922,6 +957,7 @@ def run_block_forward_benchmarks(
                     prefix_len,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
+                    teardown_fn=teardown_fn,
                 )
                 full_full_forward_stats = full_bench.bench_full_forward(
                     batch_size,
@@ -929,6 +965,7 @@ def run_block_forward_benchmarks(
                     prefix_len,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
+                    teardown_fn=teardown_fn,
                 )
                 full_reuse_stats = full_bench.bench_reuse_cache_compute(
                     batch_size,
@@ -936,6 +973,7 @@ def run_block_forward_benchmarks(
                     prefix_len,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
+                    teardown_fn=teardown_fn,
                 )
                 full_kv_load_stats = full_bench.bench_kv_load(
                     batch_size,
@@ -943,6 +981,7 @@ def run_block_forward_benchmarks(
                     prefix_len,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
+                    teardown_fn=teardown_fn,
                 )
                 full_attention_compute_stats = full_bench.bench_attention_compute(
                     batch_size,
@@ -950,6 +989,7 @@ def run_block_forward_benchmarks(
                     prefix_len,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
+                    teardown_fn=teardown_fn,
                 )
 
                 linear_shape = linear_block_shape_info(

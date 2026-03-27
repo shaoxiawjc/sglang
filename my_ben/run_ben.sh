@@ -20,18 +20,18 @@ python my_ben/bench_qwen35_block_forward.py \
     --prefix-lens 0 512 1024 2048 4096 \
     --linear-attn-backend triton
 
-python3 my_ben/bench_qwen35_overlap_recovery.py \
-    --model-path /home/wjc/resources/models/qwen3_5_9b \
-    --group-index 0 \
-    --linear-layer-count 3 \
-    --causal-layer-count 1 \
-    --linear-recompute-counts 1 2 3 \
-    --batch-sizes 1 \
-    --seq-lens 2048 4096 8192 16384 \
-    --prefix-lens 0 64 128 256 512 1024 2048 4096 \
-    --warmup-iters 10 \
-    --bench-iters 100 \
-    --linear-attn-backend triton
+# python3 my_ben/bench_qwen35_overlap_recovery.py \
+#     --model-path /home/wjc/resources/models/qwen3_5_9b \
+#     --group-index 0 \
+#     --linear-layer-count 3 \
+#     --causal-layer-count 1 \
+#     --linear-recompute-counts 1 2 3 \
+#     --batch-sizes 1 \
+#     --seq-lens 2048 4096 8192 16384 \
+#     --prefix-lens 0 64 128 256 512 1024 2048 4096 \
+#     --warmup-iters 10 \
+#     --bench-iters 100 \
+#     --linear-attn-backend triton
 
 # python3 my_ben/plot_qwen35_overlap_recovery.py \
 #     --input-dir my_ben/results/qwen35_overlap_recovery/20260319-085232

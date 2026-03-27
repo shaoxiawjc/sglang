@@ -42,6 +42,11 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     )
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--bench-iters", type=int, default=30)
+    parser.add_argument(
+        "--clear-cuda-cache-each-iter",
+        action="store_true",
+        help="Run gc.collect() and torch.cuda.empty_cache() after each warmup/bench iteration.",
+    )
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16])
     parser.add_argument("--seq-lens", type=int, nargs="+", default=[128, 512, 2048])
     parser.add_argument("--prefix-lens", type=int, nargs="+", default=[0, 4096])
