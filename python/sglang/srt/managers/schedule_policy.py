@@ -198,7 +198,8 @@ class SchedulePolicy:
             # NOTE: the prefix_indices must always be aligned with last_node
             match_result = self.tree_cache.match_prefix(
                 MatchPrefixParams(
-                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                    req=r,
                 )
             )
             (
@@ -568,6 +569,24 @@ class PrefillAdder:
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
 
+    def _get_rrmc_next_extend_len(self, req: Req) -> Optional[int]:
+        if self.rem_chunk_tokens is None:
+            return None
+
+        next_extend_len_fn = getattr(self.tree_cache, "rrmc_next_extend_len", None)
+        if next_extend_len_fn is None:
+            return None
+
+        next_extend_len = next_extend_len_fn(req)
+        if next_extend_len is None:
+            return None
+
+        next_extend_len = int(next_extend_len)
+        if next_extend_len <= 0:
+            return None
+
+        return min(next_extend_len, req.extend_input_len)
+
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
         _rem_tokens = self._get_dllm_remain_tokens()
@@ -606,8 +625,18 @@ class PrefillAdder:
             if _rem_tokens <= 0:
                 _rem_tokens = self.rem_chunk_tokens
 
-        truncated = req.extend_input_len > _rem_tokens
-        req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
+        rrmc_next_extend_len = self._get_rrmc_next_extend_len(req)
+        if rrmc_next_extend_len is not None:
+            if _rem_tokens <= 0:
+                return req
+            if rrmc_next_extend_len > _rem_tokens:
+                return req
+            target_extend_len = rrmc_next_extend_len
+        else:
+            target_extend_len = min(req.extend_input_len, _rem_tokens)
+
+        truncated = req.extend_input_len > target_extend_len
+        req.set_extend_input_len(target_extend_len)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -751,13 +780,23 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        total_tokens = req.extend_input_len + min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        planned_rrmc_extend_len = self._get_rrmc_next_extend_len(req)
+        planned_extend_len = (
+            planned_rrmc_extend_len
+            if planned_rrmc_extend_len is not None
+            else req.extend_input_len
+        )
+        total_tokens = planned_extend_len + (
+            0
+            if planned_extend_len < req.extend_input_len
+            else min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            )
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = req.extend_input_len - req.host_hit_length
+        real_input_tokens = planned_extend_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
@@ -784,6 +823,45 @@ class PrefillAdder:
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+
+            rrmc_next_extend_len = self._get_rrmc_next_extend_len(req)
+            if rrmc_next_extend_len is not None:
+                input_tokens = self.ceil_paged_tokens(rrmc_next_extend_len)
+                full_extend_len = req.extend_input_len
+                truncated = rrmc_next_extend_len < full_extend_len
+                reserved_new_tokens = (
+                    0
+                    if truncated
+                    else min(
+                        req.sampling_params.max_new_tokens,
+                        CLIP_MAX_NEW_TOKENS,
+                    )
+                )
+
+                if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+                    return AddReqResult.OTHER
+                if input_tokens + reserved_new_tokens >= self.rem_total_tokens:
+                    return AddReqResult.NO_TOKEN
+                # The scheduler and output processor assume there is at most one
+                # unfinished chunked-prefill request in a batch. RRMC segments can
+                # make multiple truncated requests fit in the same prefill budget,
+                # so guard the invariant explicitly here.
+                if truncated and (has_chunked_req or self.new_chunked_req is not None):
+                    return AddReqResult.OTHER
+
+                req.set_extend_input_len(rrmc_next_extend_len)
+                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + rrmc_next_extend_len]
+
+                self.can_run_list.append(req)
+                if truncated:
+                    self.new_chunked_req = req
+                self._req_inc_lock_ref(req)
+                self._update_prefill_budget(
+                    prefix_len,
+                    input_tokens,
+                    reserved_new_tokens,
+                )
+                return self.budget_state()
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
@@ -830,6 +908,9 @@ class PrefillAdder:
                         trunc_len = truncation_align_size * (
                             trunc_len // truncation_align_size
                         )
+
+                if has_chunked_req:
+                    return AddReqResult.OTHER
 
                 # Chunked prefill
                 req.set_extend_input_len(trunc_len)

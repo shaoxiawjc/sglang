@@ -174,6 +174,14 @@ NSA_CHOICES = [
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
+RRMC_RADIX_EVICTION_POLICY_CHOICES = [
+    "lru",
+    "lfu",
+    "gdsf",
+    "pgdsf",
+    "marconi",
+    "value_aware",
+]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -356,6 +364,9 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    enable_rrmc_radix_cache: bool = False
+    rrmc_radix_eviction_policy: str = "value_aware"
+    rrmc_marconi_alpha: float = 1.0
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -4005,6 +4016,27 @@ class ServerArgs:
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used.",
+        )
+        parser.add_argument(
+            "--enable-rrmc-radix-cache",
+            action="store_true",
+            help="Enable the RRMC block-aware radix cache for hybrid SSM models.",
+        )
+        parser.add_argument(
+            "--rrmc-radix-eviction-policy",
+            type=str,
+            choices=RRMC_RADIX_EVICTION_POLICY_CHOICES,
+            default=ServerArgs.rrmc_radix_eviction_policy,
+            help="Eviction policy for the RRMC block-aware radix cache.",
+        )
+        parser.add_argument(
+            "--rrmc-marconi-alpha",
+            type=float,
+            default=ServerArgs.rrmc_marconi_alpha,
+            help=(
+                "Alpha used by the RRMC 'marconi' eviction policy: "
+                "utility = normalized_recency + alpha * normalized_flop_efficiency."
+            ),
         )
         parser.add_argument(
             "--enable-prefill-delayer",
