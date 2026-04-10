@@ -1266,8 +1266,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    # For chunked prefill in PP
+    # For unfinished chunked prefill requests tracked across batches.
     chunked_req: Optional[Req] = None
+    chunked_reqs: Optional[List[Req]] = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -1388,6 +1389,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
+        chunked_reqs: Optional[List[Req]] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1395,6 +1397,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         is_hybrid_swa = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             is_hybrid_swa = True
+
+        resolved_chunked_reqs = (
+            list(chunked_reqs)
+            if chunked_reqs is not None
+            else ([chunked_req] if chunked_req is not None else [])
+        )
 
         return cls(
             reqs=reqs,
@@ -1412,7 +1420,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
-            chunked_req=chunked_req,
+            chunked_req=resolved_chunked_reqs[0] if resolved_chunked_reqs else None,
+            chunked_reqs=resolved_chunked_reqs,
             dllm_config=dllm_config,
         )
 

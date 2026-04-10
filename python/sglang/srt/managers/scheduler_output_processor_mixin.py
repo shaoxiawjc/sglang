@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -123,7 +123,7 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        skip_stream_req = None
+        skip_stream_reqs: Set[Req] = set()
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -246,10 +246,8 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
-                    skip_stream_req = req
+                    # Requests whose prefill is still chunked should not stream or decode yet.
+                    skip_stream_reqs.add(req)
 
                     # Incrementally update input logprobs.
                     if batch.return_logprob:
@@ -316,9 +314,10 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
+                    skip_stream_reqs.add(req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_reqs)
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
@@ -867,13 +866,22 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         reqs: List[Req],
         return_logprob: bool,
-        skip_req: Optional[Req] = None,
+        skip_reqs: Optional[Union[Req, List[Req], Set[Req]]] = None,
     ):
         """Stream the output to detokenizer."""
+        if isinstance(skip_reqs, Req):
+            skip_reqs = {skip_reqs}
+        elif skip_reqs is None:
+            skip_reqs = set()
+        else:
+            skip_reqs = set(skip_reqs)
+
         if self.is_generation:
-            self.stream_output_generation(reqs, return_logprob, skip_req)
+            self.stream_output_generation(reqs, return_logprob, skip_reqs)
         else:  # embedding or reward model
-            self.stream_output_embedding(reqs)
+            self.stream_output_embedding(
+                [req for req in reqs if req not in skip_reqs]
+            )
 
         if envs.SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS.get() > 0:
             self._trigger_crash_for_tests(
@@ -895,9 +903,16 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         reqs: List[Req],
         return_logprob: bool,
-        skip_req: Optional[Req] = None,
+        skip_reqs: Optional[Union[Req, List[Req], Set[Req]]] = None,
         is_idle_batch: bool = False,
     ):
+        if isinstance(skip_reqs, Req):
+            skip_reqs = {skip_reqs}
+        elif skip_reqs is None:
+            skip_reqs = set()
+        else:
+            skip_reqs = set(skip_reqs)
+
         rids = []
         http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
@@ -950,7 +965,7 @@ class SchedulerOutputProcessorMixin:
             ) = None
 
         for req in reqs:
-            if req is skip_req:
+            if req in skip_reqs:
                 continue
 
             if req.finished():
