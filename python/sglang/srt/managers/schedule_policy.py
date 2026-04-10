@@ -411,7 +411,7 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
-        self.new_chunked_req = None
+        self.new_chunked_reqs = []
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
@@ -749,7 +749,7 @@ class PrefillAdder:
             req.set_extend_input_len(trunc_len)
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
-            self.new_chunked_req = req
+            self.new_chunked_reqs.append(req)
             self._update_prefill_budget(0, trunc_len, 0)
 
         return self.budget_state()
@@ -842,19 +842,12 @@ class PrefillAdder:
                     return AddReqResult.OTHER
                 if input_tokens + reserved_new_tokens >= self.rem_total_tokens:
                     return AddReqResult.NO_TOKEN
-                # The scheduler and output processor assume there is at most one
-                # unfinished chunked-prefill request in a batch. RRMC segments can
-                # make multiple truncated requests fit in the same prefill budget,
-                # so guard the invariant explicitly here.
-                if truncated and (has_chunked_req or self.new_chunked_req is not None):
-                    return AddReqResult.OTHER
-
                 req.set_extend_input_len(rrmc_next_extend_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + rrmc_next_extend_len]
 
                 self.can_run_list.append(req)
                 if truncated:
-                    self.new_chunked_req = req
+                    self.new_chunked_reqs.append(req)
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
@@ -909,7 +902,7 @@ class PrefillAdder:
                             trunc_len // truncation_align_size
                         )
 
-                if has_chunked_req:
+                if has_chunked_req or self.new_chunked_reqs:
                     return AddReqResult.OTHER
 
                 # Chunked prefill
@@ -917,7 +910,7 @@ class PrefillAdder:
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
+                self.new_chunked_reqs.append(req)
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
