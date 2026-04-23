@@ -2251,6 +2251,10 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    @staticmethod
+    def _num_new_req_slots(reqs: List[Req]) -> int:
+        return sum(1 for req in reqs if req.req_pool_idx is None)
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2395,11 +2399,14 @@ class Scheduler(
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    self.running_batch.batch_is_full = True
+            # Some unfinished chunked prefill requests live in self.chunked_reqs
+            # instead of running_batch, but they still hold req_to_token_pool slots.
+            # Only requests without req_pool_idx need new slots in alloc_for_extend.
+            if req.req_pool_idx is None and (
+                self._num_new_req_slots(adder.can_run_list)
+                >= self.req_to_token_pool.available_size()
+            ):
+                self.running_batch.batch_is_full = True
 
             if self.running_batch.batch_is_full:
                 if (
