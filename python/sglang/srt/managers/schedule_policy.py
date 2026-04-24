@@ -629,9 +629,10 @@ class PrefillAdder:
         if rrmc_next_extend_len is not None:
             if _rem_tokens <= 0:
                 return req
-            if rrmc_next_extend_len > _rem_tokens:
-                return req
-            target_extend_len = rrmc_next_extend_len
+            if rrmc_next_extend_len <= _rem_tokens:
+                target_extend_len = rrmc_next_extend_len
+            else:
+                target_extend_len = min(req.extend_input_len, _rem_tokens)
         else:
             target_extend_len = min(req.extend_input_len, _rem_tokens)
 
@@ -781,6 +782,12 @@ class PrefillAdder:
             return self.add_one_req_ignore_eos(req)
 
         planned_rrmc_extend_len = self._get_rrmc_next_extend_len(req)
+        if (
+            planned_rrmc_extend_len is not None
+            and self.rem_chunk_tokens is not None
+            and planned_rrmc_extend_len > self.rem_chunk_tokens
+        ):
+            planned_rrmc_extend_len = None
         planned_extend_len = (
             planned_rrmc_extend_len
             if planned_rrmc_extend_len is not None
@@ -825,7 +832,13 @@ class PrefillAdder:
                 req.cache_protected_len = prefix_len
 
             rrmc_next_extend_len = self._get_rrmc_next_extend_len(req)
-            if rrmc_next_extend_len is not None:
+            if (
+                rrmc_next_extend_len is not None
+                and (
+                    self.rem_chunk_tokens is None
+                    or rrmc_next_extend_len <= self.rem_chunk_tokens
+                )
+            ):
                 input_tokens = self.ceil_paged_tokens(rrmc_next_extend_len)
                 full_extend_len = req.extend_input_len
                 truncated = rrmc_next_extend_len < full_extend_len

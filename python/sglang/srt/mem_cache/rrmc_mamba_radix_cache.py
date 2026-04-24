@@ -58,6 +58,7 @@ class RRMCSegmentSpec:
     token_count: int
     start: int
     end: int
+    is_block_end: bool
 
     @property
     def identity(self) -> tuple[Any, ...]:
@@ -83,8 +84,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
     - Only page_size == 1 is supported for RRMC mode.
     - Nodes are created per cacheable segment. Large blocks are split into
       fixed-size segments so chunked prefill boundaries can align with the tree.
-    - Mamba state is attached only to the deepest completed segment in the
-      current save point, which must correspond to a true execution boundary.
+    - KV nodes may still be segment-shaped internally, but reusable Mamba state
+      is attached only at completed cacheable block ends.
     """
 
     def __init__(self, params):
@@ -176,7 +177,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         ]
 
         segment_specs = self._get_cacheable_prefix_segments(
-            req, self._current_track_limit(req, kv_committed_len)
+            req, kv_committed_len
         )
         cached_len = req.cache_protected_len
         if is_insert and segment_specs:
@@ -198,8 +199,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         if self.disable:
             return self._skip_cache_unfinished_req(req, len(token_ids))
 
-        cache_limit = self._current_track_limit(req, len(token_ids))
-        segment_specs = self._get_cacheable_prefix_segments(req, cache_limit)
+        segment_specs = self._get_cacheable_prefix_segments(req, len(token_ids))
         if not segment_specs:
             return self._skip_cache_unfinished_req(req, len(token_ids))
 
@@ -316,15 +316,18 @@ class RRMCMambaRadixCache(MambaRadixCache):
         return min(track_limit, len(req.origin_input_ids))
 
     def rrmc_next_extend_len(self, req: Req) -> Optional[int]:
-        segment_specs = self._get_req_segments(req)
-        if not segment_specs:
+        block_specs = self._get_cacheable_blocks(req)
+        if not block_specs:
             return None
 
         prefix_len = len(req.prefix_indices)
-        for segment in segment_specs:
-            if segment.end > prefix_len:
-                return segment.end - prefix_len
+        for block in block_specs:
+            if block.end > prefix_len:
+                return block.end - prefix_len
         return None
+
+    def rrmc_disable_operator_chunk_state_tracking(self, req: Req) -> bool:
+        return self._get_cacheable_blocks(req) is not None
 
     def _get_req_blocks(self, req: Req) -> Optional[list[RRMCBlockSpec]]:
         cached = getattr(req, "_rrmc_block_specs_cache", None)
@@ -395,14 +398,12 @@ class RRMCMambaRadixCache(MambaRadixCache):
         if cached is not None:
             return cached
 
-        block_specs = self._get_req_blocks(req)
+        block_specs = self._get_cacheable_blocks(req)
         if not block_specs:
             return None
 
         segment_specs: list[RRMCSegmentSpec] = []
         for block in block_specs:
-            if not block.cacheable:
-                break
             segment_idx = 0
             segment_start = block.start
             while segment_start < block.end:
@@ -418,6 +419,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
                         token_count=segment_end - segment_start,
                         start=segment_start,
                         end=segment_end,
+                        is_block_end=segment_end == block.end,
                     )
                 )
                 segment_idx += 1
@@ -442,12 +444,39 @@ class RRMCMambaRadixCache(MambaRadixCache):
             return None
 
         token_limit = min(token_limit, len(req.origin_input_ids))
+        last_completed_end = self._last_completed_cacheable_block_end(req, token_limit)
+        if last_completed_end <= 0:
+            return None
         cacheable_segments: list[RRMCSegmentSpec] = []
         for segment in segment_specs:
-            if segment.end > token_limit:
+            if segment.end > last_completed_end:
                 break
             cacheable_segments.append(segment)
         return cacheable_segments
+
+    def _get_cacheable_blocks(self, req: Req) -> Optional[list[RRMCBlockSpec]]:
+        block_specs = self._get_req_blocks(req)
+        if not block_specs:
+            return None
+
+        cacheable_blocks: list[RRMCBlockSpec] = []
+        for block in block_specs:
+            if not block.cacheable:
+                break
+            cacheable_blocks.append(block)
+        return cacheable_blocks or None
+
+    def _last_completed_cacheable_block_end(self, req: Req, token_limit: int) -> int:
+        block_specs = self._get_cacheable_blocks(req)
+        if not block_specs:
+            return 0
+
+        last_completed_end = 0
+        for block in block_specs:
+            if block.end > token_limit:
+                break
+            last_completed_end = block.end
+        return last_completed_end
 
     def _make_tree_key(
         self, parent: TreeNode, extra_key: Optional[str], segment: RRMCSegmentSpec
@@ -508,17 +537,6 @@ class RRMCMambaRadixCache(MambaRadixCache):
         return True
 
     def _get_req_mamba_source(self, req: Req) -> Optional[torch.Tensor]:
-        if self.enable_mamba_extra_buffer:
-            if (
-                req.mamba_ping_pong_track_buffer is None
-                or req.mamba_next_track_idx is None
-            ):
-                return None
-            buffer_idx = self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                req.mamba_next_track_idx
-            )
-            return req.mamba_ping_pong_track_buffer[buffer_idx].unsqueeze(-1)
-
         if req.req_pool_idx is not None:
             return self.req_to_token_pool.get_mamba_indices(req.req_pool_idx).unsqueeze(
                 -1

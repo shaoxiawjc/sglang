@@ -2406,7 +2406,7 @@ class Scheduler(
                 self._num_new_req_slots(adder.can_run_list)
                 >= self.req_to_token_pool.available_size()
             ):
-                self.running_batch.batch_is_full = True
+                break
 
             if self.running_batch.batch_is_full:
                 if (
