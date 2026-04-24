@@ -1770,6 +1770,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
+        disable_rrmc_tracking_fn = getattr(
+            self.tree_cache, "rrmc_disable_operator_chunk_state_tracking", None
+        )
+        if (
+            callable(disable_rrmc_tracking_fn)
+            and disable_rrmc_tracking_fn(req)
+        ):
+            mamba_track_mask_cpu.append(False)
+            mamba_track_indices_cpu.append(
+                req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
+            )
+            req.mamba_last_track_seqlen = None
+            mamba_track_seqlens_cpu.append(-1)
+            return
+
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
         mask = req.extend_input_len >= mamba_cache_chunk_size
         mamba_track_mask_cpu.append(mask)
