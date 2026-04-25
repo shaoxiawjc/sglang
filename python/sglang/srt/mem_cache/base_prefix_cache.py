@@ -41,6 +41,7 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    log_stats: bool = True
 
 
 @dataclasses.dataclass

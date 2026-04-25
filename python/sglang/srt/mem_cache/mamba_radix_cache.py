@@ -68,6 +68,9 @@ ANSI_GREEN = "\x1b[32m"
 ANSI_YELLOW = "\x1b[33m"
 ANSI_RED = "\x1b[31m"
 
+NATIVE_HIT_TOKEN_COUNT = 0
+NATIVE_EVICT_TOKEN_COUNT = 0
+
 class TreeNode:
 
     counter = 0
@@ -452,6 +455,7 @@ class MambaRadixCache(BasePrefixCache):
         return True
 
     def reset(self) -> None:
+        self._reset_cache_perf_counters()
         self.root_node = TreeNode()
         self.root_node.key = RadixKey([], None)
         self.root_node.value = []
@@ -489,7 +493,10 @@ class MambaRadixCache(BasePrefixCache):
             )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
-        return self._match_post_processor(params, value, last_node, best_value_len)
+        result = self._match_post_processor(params, value, last_node, best_value_len)
+        if params.log_stats:
+            self._log_native_stats(hit_tokens=len(result.device_indices))
+        return result
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -677,7 +684,10 @@ class MambaRadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+            MatchPrefixParams(
+                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                log_stats=False,
+            )
         )
         new_indices, new_last_node = (
             match_result.device_indices,
@@ -760,6 +770,11 @@ class MambaRadixCache(BasePrefixCache):
             full_num_evicted = self.evict_full(params.num_tokens)
         if params.mamba_num > 0:
             mamba_num_evicted = self.evict_mamba(params.mamba_num)
+
+        self._log_native_stats(
+            evicted_tokens=full_num_evicted,
+            evicted_mamba_states=mamba_num_evicted,
+        )
 
         return EvictResult(
             num_tokens_evicted=full_num_evicted, mamba_num_evicted=mamba_num_evicted
@@ -1245,6 +1260,18 @@ class MambaRadixCache(BasePrefixCache):
             stack.extend(cur_node.children.values())
         return ret_list
 
+    def _count_tree_mamba_states(self) -> int:
+        return sum(
+            1
+            for node in self._collect_all_nodes()
+            if node is not self.root_node and node.mamba_value is not None
+        )
+
+    def _reset_cache_perf_counters(self) -> None:
+        global NATIVE_HIT_TOKEN_COUNT, NATIVE_EVICT_TOKEN_COUNT
+        NATIVE_HIT_TOKEN_COUNT = 0
+        NATIVE_EVICT_TOKEN_COUNT = 0
+
     def _print_helper(self, node: TreeNode, indent: int) -> None:
         """Prints the radix tree in a human-readable format."""
         stack = [(node, indent)]
@@ -1282,51 +1309,39 @@ class MambaRadixCache(BasePrefixCache):
                 stack.append(child)
         return total_size, total_mamba_size
 
-    def _log_rrmc_stats(
+    def _log_native_stats(
         self,
         *,
-        hit_blocks: int,
-        hit_tokens: int,
-        evicted_blocks: int,
-        evicted_tokens: int,
+        hit_tokens: int = 0,
+        evicted_tokens: int = 0,
+        evicted_mamba_states: int = 0,
     ) -> None:
-        global HIT_TOKEN_COUNT, EVICT_TOKEN_COUNT
-        if (
-            hit_blocks <= 0
-            and hit_tokens <= 0
-            and evicted_blocks <= 0
-            and evicted_tokens <= 0
-        ):
+        global NATIVE_HIT_TOKEN_COUNT, NATIVE_EVICT_TOKEN_COUNT
+        if hit_tokens <= 0 and evicted_tokens <= 0 and evicted_mamba_states <= 0:
             return
         tree_mamba_states = self._count_tree_mamba_states()
-        HIT_TOKEN_COUNT += hit_tokens
-        EVICT_TOKEN_COUNT += evicted_tokens
+        NATIVE_HIT_TOKEN_COUNT += hit_tokens
+        NATIVE_EVICT_TOKEN_COUNT += evicted_tokens
         logger.info(
-            "%sRRMC stats%s %shit_blocks=%s%s %shit_tokens=%s%s %sevicted_blocks=%s%s %sevicted_tokens=%s%s %stree_mamba_states=%s%s",
+            "%sMambaRadixCache stats%s %shit_tokens=%s%s %stotal_hit_tokens=%s%s %sevicted_tokens=%s%s %stotal_evicted_tokens=%s%s %sevicted_mamba_states=%s%s %stree_mamba_states=%s%s",
             ANSI_CYAN,
-            ANSI_RESET,
-            ANSI_GREEN,
-            hit_blocks,
             ANSI_RESET,
             ANSI_YELLOW,
             hit_tokens,
             ANSI_RESET,
-            ANSI_RED,
-            evicted_blocks,
+            ANSI_GREEN,
+            NATIVE_HIT_TOKEN_COUNT,
             ANSI_RESET,
             ANSI_RED,
             evicted_tokens,
+            ANSI_RESET,
+            ANSI_RED,
+            NATIVE_EVICT_TOKEN_COUNT,
+            ANSI_RESET,
+            ANSI_RED,
+            evicted_mamba_states,
             ANSI_RESET,
             ANSI_CYAN,
             tree_mamba_states,
             ANSI_RESET,
         )
-        logger.info(
-            "Cache Perfermance: %shit_token:%s%s, %sevicted_token:%s%s",
-            ANSI_CYAN,
-            hit_tokens,
-            ANSI_RESET,
-            ANSI_GREEN,
-            evicted_tokens,
-            ANSI_RESET
-            )
