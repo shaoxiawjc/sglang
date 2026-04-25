@@ -62,6 +62,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+ANSI_RESET = "\x1b[0m"
+ANSI_CYAN = "\x1b[36m"
+ANSI_GREEN = "\x1b[32m"
+ANSI_YELLOW = "\x1b[33m"
+ANSI_RED = "\x1b[31m"
 
 class TreeNode:
 
@@ -1276,3 +1281,52 @@ class MambaRadixCache(BasePrefixCache):
                     continue
                 stack.append(child)
         return total_size, total_mamba_size
+
+    def _log_rrmc_stats(
+        self,
+        *,
+        hit_blocks: int,
+        hit_tokens: int,
+        evicted_blocks: int,
+        evicted_tokens: int,
+    ) -> None:
+        global HIT_TOKEN_COUNT, EVICT_TOKEN_COUNT
+        if (
+            hit_blocks <= 0
+            and hit_tokens <= 0
+            and evicted_blocks <= 0
+            and evicted_tokens <= 0
+        ):
+            return
+        tree_mamba_states = self._count_tree_mamba_states()
+        HIT_TOKEN_COUNT += hit_tokens
+        EVICT_TOKEN_COUNT += evicted_tokens
+        logger.info(
+            "%sRRMC stats%s %shit_blocks=%s%s %shit_tokens=%s%s %sevicted_blocks=%s%s %sevicted_tokens=%s%s %stree_mamba_states=%s%s",
+            ANSI_CYAN,
+            ANSI_RESET,
+            ANSI_GREEN,
+            hit_blocks,
+            ANSI_RESET,
+            ANSI_YELLOW,
+            hit_tokens,
+            ANSI_RESET,
+            ANSI_RED,
+            evicted_blocks,
+            ANSI_RESET,
+            ANSI_RED,
+            evicted_tokens,
+            ANSI_RESET,
+            ANSI_CYAN,
+            tree_mamba_states,
+            ANSI_RESET,
+        )
+        logger.info(
+            "Cache Perfermance: %shit_token:%s%s, %sevicted_token:%s%s",
+            ANSI_CYAN,
+            hit_tokens,
+            ANSI_RESET,
+            ANSI_GREEN,
+            evicted_tokens,
+            ANSI_RESET
+            )
