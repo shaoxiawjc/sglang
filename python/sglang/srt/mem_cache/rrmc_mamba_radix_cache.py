@@ -120,6 +120,12 @@ class RRMCMambaRadixCache(MambaRadixCache):
         )
         # self.disable = True
 
+    def _reset_cache_perf_counters(self) -> None:
+        super()._reset_cache_perf_counters()
+        global HIT_TOKEN_COUNT, EVICT_TOKEN_COUNT
+        HIT_TOKEN_COUNT = 0
+        EVICT_TOKEN_COUNT = 0
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         req = params.req
         if self.disable or req is None:
