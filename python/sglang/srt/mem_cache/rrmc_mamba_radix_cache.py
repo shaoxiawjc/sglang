@@ -47,6 +47,11 @@ class RRMCBlockSpec:
         return (self.block_type, self.block_id, self.version, self.token_count)
 
 
+HIT_TOKEN_COUNT = 0
+EVICT_TOKEN_COUNT = 0
+
+
+
 @dataclasses.dataclass(frozen=True)
 class RRMCSegmentSpec:
     block_identity: tuple[str, str, str, int]
@@ -781,6 +786,12 @@ class RRMCMambaRadixCache(MambaRadixCache):
             if node is not self.root_node and node.value is not None
         )
 
+
+    def _count_tree_mamba_states(self,) -> int:
+        return sum(
+            1 for node in self._collect_all_nodes() if node is not self.root_node and node.mamba_value is not None
+            )
+
     def _log_rrmc_stats(
         self,
         *,
@@ -789,6 +800,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         evicted_blocks: int,
         evicted_tokens: int,
     ) -> None:
+        global HIT_TOKEN_COUNT, EVICT_TOKEN_COUNT
         if (
             hit_blocks <= 0
             and hit_tokens <= 0
@@ -796,8 +808,11 @@ class RRMCMambaRadixCache(MambaRadixCache):
             and evicted_tokens <= 0
         ):
             return
+        tree_mamba_states = self._count_tree_mamba_states()
+        HIT_TOKEN_COUNT += hit_tokens
+        EVICT_TOKEN_COUNT += evicted_tokens
         logger.info(
-            "%sRRMC stats%s %shit_blocks=%s%s %shit_tokens=%s%s %sevicted_blocks=%s%s %sevicted_tokens=%s%s",
+            "%sRRMC stats%s %shit_blocks=%s%s %shit_tokens=%s%s %sevicted_blocks=%s%s %sevicted_tokens=%s%s %stree_mamba_states=%s%s",
             ANSI_CYAN,
             ANSI_RESET,
             ANSI_GREEN,
@@ -812,4 +827,16 @@ class RRMCMambaRadixCache(MambaRadixCache):
             ANSI_RED,
             evicted_tokens,
             ANSI_RESET,
+            ANSI_CYAN,
+            tree_mamba_states,
+            ANSI_RESET,
         )
+        logger.info(
+            "Cache Perfermance: %shit_token:%s%s, %sevicted_token:%s%s",
+            ANSI_CYAN,
+            hit_tokens,
+            ANSI_RESET,
+            ANSI_GREEN,
+            evicted_tokens,
+            ANSI_RESET
+            )
