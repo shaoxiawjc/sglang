@@ -225,6 +225,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def pretty_print(self):
         raise NotImplementedError()
 
+    def get_cache_metrics(self) -> dict[str, Any]:
+        return {}
+
     def init_load_back(
         self,
         params: InitLoadBackParams,

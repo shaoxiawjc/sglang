@@ -3082,7 +3082,7 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = vars(get_global_server_args())
+        ret = dict(vars(get_global_server_args()))
         ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
@@ -3101,6 +3101,10 @@ class Scheduler(
 
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
+
+        cache_metrics_fn = getattr(self.tree_cache, "get_cache_metrics", None)
+        if callable(cache_metrics_fn):
+            ret["cache_metrics"] = cache_metrics_fn()
 
         # This field is not serializable.
         ret.pop("model_config", None)

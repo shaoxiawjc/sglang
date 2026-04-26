@@ -22,7 +22,7 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 import heapq
 from collections import defaultdict
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 from numpy import float64
@@ -68,9 +68,6 @@ ANSI_GREEN = "\x1b[32m"
 ANSI_YELLOW = "\x1b[33m"
 ANSI_RED = "\x1b[31m"
 
-NATIVE_HIT_TOKEN_COUNT = 0
-NATIVE_EVICT_TOKEN_COUNT = 0
-
 class TreeNode:
 
     counter = 0
@@ -95,6 +92,8 @@ class TreeNode:
 
         self.hit_count = 0
         self.host_ref_counter = 0
+        self.has_been_shared = False
+        self.is_checkpoint_state = False
         # store the host indices of KV cache
         self.host_value = None
         # store hash values of each pages
@@ -495,7 +494,7 @@ class MambaRadixCache(BasePrefixCache):
         value, last_node, best_value_len = self._match_prefix_helper(key)
         result = self._match_post_processor(params, value, last_node, best_value_len)
         if params.log_stats:
-            self._log_native_stats(hit_tokens=len(result.device_indices))
+            self._log_cache_stats(hit_tokens=len(result.device_indices))
         return result
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -737,6 +736,7 @@ class MambaRadixCache(BasePrefixCache):
         ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
 
         assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
+        self._on_checkpoint_evicted(x)
         # 1. a leaf node, free full tokens and mamba
         self.token_to_kv_pool_allocator.free(x.value)
         full_num_evicted = len(x.value)
@@ -771,7 +771,7 @@ class MambaRadixCache(BasePrefixCache):
         if params.mamba_num > 0:
             mamba_num_evicted = self.evict_mamba(params.mamba_num)
 
-        self._log_native_stats(
+        self._log_cache_stats(
             evicted_tokens=full_num_evicted,
             evicted_mamba_states=mamba_num_evicted,
         )
@@ -851,6 +851,8 @@ class MambaRadixCache(BasePrefixCache):
 
         # protect mamba value in current node if it exists
         if node.mamba_value is not None:
+            if getattr(node, "is_checkpoint_state", False) and node.mamba_lock_ref >= 1:
+                node.has_been_shared = True
             if node.mamba_lock_ref == 0:
                 self.mamba_evictable_size_ -= len(node.mamba_value)
                 self.mamba_protected_size_ += len(node.mamba_value)
@@ -1174,12 +1176,14 @@ class MambaRadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
+            self._on_checkpoint_created(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
+            self._on_checkpoint_created(node)
         else:  # mamba value already exists
             mamba_value_exist = True
             self.full_lru_list.reset_node_mru(node)
@@ -1225,6 +1229,7 @@ class MambaRadixCache(BasePrefixCache):
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
+        self._on_checkpoint_evicted(node)
         self.mamba_evictable_size_ -= len(node.mamba_value)
         node.mamba_value = None
 
@@ -1268,9 +1273,65 @@ class MambaRadixCache(BasePrefixCache):
         )
 
     def _reset_cache_perf_counters(self) -> None:
-        global NATIVE_HIT_TOKEN_COUNT, NATIVE_EVICT_TOKEN_COUNT
-        NATIVE_HIT_TOKEN_COUNT = 0
-        NATIVE_EVICT_TOKEN_COUNT = 0
+        self.total_hit_tokens = 0
+        self.total_evicted_tokens = 0
+        self.total_evicted_mamba_states = 0
+        self.total_generated_checkpoints = 0
+        self.total_evicted_checkpoints = 0
+        self.total_zombie_checkpoints = 0
+
+    def _on_checkpoint_created(self, node: TreeNode) -> None:
+        node.is_checkpoint_state = True
+        node.has_been_shared = False
+        self.total_generated_checkpoints += 1
+
+    def _on_checkpoint_evicted(self, node: TreeNode) -> None:
+        if not getattr(node, "is_checkpoint_state", False):
+            return
+        self.total_evicted_checkpoints += 1
+        if not getattr(node, "has_been_shared", False):
+            self.total_zombie_checkpoints += 1
+        node.is_checkpoint_state = False
+        node.has_been_shared = False
+
+    def _count_live_checkpoint_nodes(self) -> tuple[int, int]:
+        live_checkpoint_nodes = 0
+        live_unshared_checkpoint_nodes = 0
+        for node in self._collect_all_nodes():
+            if node is self.root_node:
+                continue
+            if not getattr(node, "is_checkpoint_state", False):
+                continue
+            if node.mamba_value is None:
+                continue
+            live_checkpoint_nodes += 1
+            if not getattr(node, "has_been_shared", False):
+                live_unshared_checkpoint_nodes += 1
+        return live_checkpoint_nodes, live_unshared_checkpoint_nodes
+
+    def get_cache_metrics(self) -> dict[str, Any]:
+        live_checkpoint_nodes, live_unshared_checkpoint_nodes = (
+            self._count_live_checkpoint_nodes()
+        )
+        zombie_state_ratio = (
+            self.total_zombie_checkpoints / self.total_generated_checkpoints
+            if self.total_generated_checkpoints > 0
+            else 0.0
+        )
+        return {
+            "cache_type": self.__class__.__name__,
+            "total_hit_tokens": int(self.total_hit_tokens),
+            "total_evicted_tokens": int(self.total_evicted_tokens),
+            "total_evicted_mamba_states": int(self.total_evicted_mamba_states),
+            "total_generated_checkpoints": int(self.total_generated_checkpoints),
+            "total_evicted_checkpoints": int(self.total_evicted_checkpoints),
+            "zombie_checkpoint_count": int(self.total_zombie_checkpoints),
+            "zombie_state_ratio": float(zombie_state_ratio),
+            "unused_checkpoint_rate": float(zombie_state_ratio),
+            "live_checkpoint_count": int(live_checkpoint_nodes),
+            "live_unshared_checkpoint_count": int(live_unshared_checkpoint_nodes),
+            "tree_mamba_states": int(self._count_tree_mamba_states()),
+        }
 
     def _print_helper(self, node: TreeNode, indent: int) -> None:
         """Prints the radix tree in a human-readable format."""
@@ -1309,39 +1370,44 @@ class MambaRadixCache(BasePrefixCache):
                 stack.append(child)
         return total_size, total_mamba_size
 
-    def _log_native_stats(
+    def _log_cache_stats(
         self,
         *,
         hit_tokens: int = 0,
         evicted_tokens: int = 0,
         evicted_mamba_states: int = 0,
+        extra_fields: Optional[dict[str, Any]] = None,
     ) -> None:
-        global NATIVE_HIT_TOKEN_COUNT, NATIVE_EVICT_TOKEN_COUNT
         if hit_tokens <= 0 and evicted_tokens <= 0 and evicted_mamba_states <= 0:
             return
-        tree_mamba_states = self._count_tree_mamba_states()
-        NATIVE_HIT_TOKEN_COUNT += hit_tokens
-        NATIVE_EVICT_TOKEN_COUNT += evicted_tokens
+        self.total_hit_tokens += int(hit_tokens)
+        self.total_evicted_tokens += int(evicted_tokens)
+        self.total_evicted_mamba_states += int(evicted_mamba_states)
+        metrics = self.get_cache_metrics()
+        extra_fields = extra_fields or {}
+        extras = "".join(
+            f" {key}={value}"
+            for key, value in extra_fields.items()
+            if value is not None
+        )
         logger.info(
-            "%sMambaRadixCache stats%s %shit_tokens=%s%s %stotal_hit_tokens=%s%s %sevicted_tokens=%s%s %stotal_evicted_tokens=%s%s %sevicted_mamba_states=%s%s %stree_mamba_states=%s%s",
-            ANSI_CYAN,
-            ANSI_RESET,
-            ANSI_YELLOW,
-            hit_tokens,
-            ANSI_RESET,
-            ANSI_GREEN,
-            NATIVE_HIT_TOKEN_COUNT,
-            ANSI_RESET,
-            ANSI_RED,
-            evicted_tokens,
-            ANSI_RESET,
-            ANSI_RED,
-            NATIVE_EVICT_TOKEN_COUNT,
-            ANSI_RESET,
-            ANSI_RED,
-            evicted_mamba_states,
-            ANSI_RESET,
-            ANSI_CYAN,
-            tree_mamba_states,
-            ANSI_RESET,
+            "%s stats hit_tokens=%d total_hit_tokens=%d evicted_tokens=%d total_evicted_tokens=%d "
+            "evicted_mamba_states=%d total_evicted_mamba_states=%d generated_checkpoints=%d "
+            "evicted_checkpoints=%d zombie_checkpoints=%d zombie_state_ratio=%.6f "
+            "live_checkpoint_count=%d live_unshared_checkpoint_count=%d tree_mamba_states=%d%s",
+            metrics["cache_type"],
+            int(hit_tokens),
+            metrics["total_hit_tokens"],
+            int(evicted_tokens),
+            metrics["total_evicted_tokens"],
+            int(evicted_mamba_states),
+            metrics["total_evicted_mamba_states"],
+            metrics["total_generated_checkpoints"],
+            metrics["total_evicted_checkpoints"],
+            metrics["zombie_checkpoint_count"],
+            metrics["zombie_state_ratio"],
+            metrics["live_checkpoint_count"],
+            metrics["live_unshared_checkpoint_count"],
+            metrics["tree_mamba_states"],
+            extras,
         )

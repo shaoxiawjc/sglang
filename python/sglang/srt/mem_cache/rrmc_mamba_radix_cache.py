@@ -47,11 +47,6 @@ class RRMCBlockSpec:
         return (self.block_type, self.block_id, self.version, self.token_count)
 
 
-HIT_TOKEN_COUNT = 0
-EVICT_TOKEN_COUNT = 0
-
-
-
 @dataclasses.dataclass(frozen=True)
 class RRMCSegmentSpec:
     block_identity: tuple[str, str, str, int]
@@ -122,9 +117,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
 
     def _reset_cache_perf_counters(self) -> None:
         super()._reset_cache_perf_counters()
-        global HIT_TOKEN_COUNT, EVICT_TOKEN_COUNT
-        HIT_TOKEN_COUNT = 0
-        EVICT_TOKEN_COUNT = 0
+        self.total_hit_blocks = 0
+        self.total_evicted_blocks = 0
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         req = params.req
@@ -163,7 +157,9 @@ class RRMCMambaRadixCache(MambaRadixCache):
             node.hit_count += 1
 
         self._log_rrmc_stats(
-            hit_blocks=len(matched_nodes[:best_value_len]),
+            hit_blocks=sum(
+                1 for node in matched_nodes[:best_value_len] if node.mamba_value is not None
+            ),
             hit_tokens=int(best_last_node.rrmc_prefix_tokens),
             evicted_blocks=0,
             evicted_tokens=0,
@@ -545,6 +541,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         node.last_access_time = get_last_access_time()
         self.mamba_lru_list.insert_mru(node)
         self.mamba_evictable_size_ += len(dst_index)
+        self._on_checkpoint_created(node)
         return True
 
     def _get_req_mamba_source(self, req: Req) -> Optional[torch.Tensor]:
@@ -789,14 +786,10 @@ class RRMCMambaRadixCache(MambaRadixCache):
         return sum(
             1
             for node in self._collect_all_nodes()
-            if node is not self.root_node and node.value is not None
+            if node is not self.root_node
+            and getattr(node, "is_checkpoint_state", False)
+            and node.mamba_value is not None
         )
-
-
-    def _count_tree_mamba_states(self,) -> int:
-        return sum(
-            1 for node in self._collect_all_nodes() if node is not self.root_node and node.mamba_value is not None
-            )
 
     def _log_rrmc_stats(
         self,
@@ -806,7 +799,6 @@ class RRMCMambaRadixCache(MambaRadixCache):
         evicted_blocks: int,
         evicted_tokens: int,
     ) -> None:
-        global HIT_TOKEN_COUNT, EVICT_TOKEN_COUNT
         if (
             hit_blocks <= 0
             and hit_tokens <= 0
@@ -814,35 +806,21 @@ class RRMCMambaRadixCache(MambaRadixCache):
             and evicted_tokens <= 0
         ):
             return
-        tree_mamba_states = self._count_tree_mamba_states()
-        HIT_TOKEN_COUNT += hit_tokens
-        EVICT_TOKEN_COUNT += evicted_tokens
-        logger.info(
-            "%sRRMC stats%s %shit_blocks=%s%s %shit_tokens=%s%s %sevicted_blocks=%s%s %sevicted_tokens=%s%s %stree_mamba_states=%s%s",
-            ANSI_CYAN,
-            ANSI_RESET,
-            ANSI_GREEN,
-            hit_blocks,
-            ANSI_RESET,
-            ANSI_YELLOW,
-            hit_tokens,
-            ANSI_RESET,
-            ANSI_RED,
-            evicted_blocks,
-            ANSI_RESET,
-            ANSI_RED,
-            evicted_tokens,
-            ANSI_RESET,
-            ANSI_CYAN,
-            tree_mamba_states,
-            ANSI_RESET,
+        self.total_hit_blocks += int(hit_blocks)
+        self.total_evicted_blocks += int(evicted_blocks)
+        self._log_cache_stats(
+            hit_tokens=hit_tokens,
+            evicted_tokens=evicted_tokens,
+            extra_fields={
+                "hit_blocks": int(hit_blocks),
+                "total_hit_blocks": int(self.total_hit_blocks),
+                "evicted_blocks": int(evicted_blocks),
+                "total_evicted_blocks": int(self.total_evicted_blocks),
+            },
         )
-        logger.info(
-            "Cache Perfermance: %shit_token:%s%s, %sevicted_token:%s%s",
-            ANSI_CYAN,
-            hit_tokens,
-            ANSI_RESET,
-            ANSI_GREEN,
-            evicted_tokens,
-            ANSI_RESET
-            )
+
+    def get_cache_metrics(self) -> dict[str, Any]:
+        metrics = super().get_cache_metrics()
+        metrics["total_hit_blocks"] = int(self.total_hit_blocks)
+        metrics["total_evicted_blocks"] = int(self.total_evicted_blocks)
+        return metrics

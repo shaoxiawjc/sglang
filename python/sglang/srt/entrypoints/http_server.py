@@ -632,6 +632,57 @@ async def server_info():
     }
 
 
+def _aggregate_cache_metrics(
+    internal_states: List[Dict[Any, Any]],
+) -> Dict[str, Any]:
+    per_scheduler: List[Dict[str, Any]] = []
+    for state in internal_states:
+        cache_metrics = state.get("cache_metrics")
+        if isinstance(cache_metrics, dict) and cache_metrics:
+            per_scheduler.append(cache_metrics)
+
+    aggregate: Dict[str, Any] = {
+        "scheduler_count": len(per_scheduler),
+        "cache_types": sorted(
+            {str(metrics.get("cache_type", "")) for metrics in per_scheduler}
+        ),
+    }
+    sum_fields = (
+        "total_hit_tokens",
+        "total_evicted_tokens",
+        "total_evicted_mamba_states",
+        "total_generated_checkpoints",
+        "total_evicted_checkpoints",
+        "zombie_checkpoint_count",
+        "live_checkpoint_count",
+        "live_unshared_checkpoint_count",
+        "tree_mamba_states",
+        "total_hit_blocks",
+        "total_evicted_blocks",
+    )
+    for field in sum_fields:
+        aggregate[field] = sum(int(metrics.get(field, 0) or 0) for metrics in per_scheduler)
+
+    generated = int(aggregate.get("total_generated_checkpoints", 0))
+    zombie = int(aggregate.get("zombie_checkpoint_count", 0))
+    zombie_ratio = (zombie / generated) if generated > 0 else 0.0
+    aggregate["zombie_state_ratio"] = zombie_ratio
+    aggregate["unused_checkpoint_rate"] = zombie_ratio
+    return {
+        "aggregate": aggregate,
+        "per_scheduler": per_scheduler,
+    }
+
+
+@app.get("/get_cache_metrics")
+@app.get("/cache_metrics")
+async def cache_metrics():
+    internal_states: List[Dict[Any, Any]] = (
+        await _global_state.tokenizer_manager.get_internal_state()
+    )
+    return _aggregate_cache_metrics(internal_states)
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead)."""
