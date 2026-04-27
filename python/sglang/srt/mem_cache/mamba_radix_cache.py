@@ -91,6 +91,8 @@ class TreeNode:
         self.last_access_time = get_last_access_time()
 
         self.hit_count = 0
+        self.accepted_hit_count = 0
+        self.accepted_mamba_hit_count = 0
         self.host_ref_counter = 0
         self.has_been_shared = False
         self.has_token_been_shared = False
@@ -1102,6 +1104,8 @@ class MambaRadixCache(BasePrefixCache):
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        new_node.accepted_hit_count = getattr(child, "accepted_hit_count", 0)
+        new_node.accepted_mamba_hit_count = 0
         new_node.has_token_been_shared = getattr(
             child, "has_token_been_shared", False
         )
@@ -1324,7 +1328,10 @@ class MambaRadixCache(BasePrefixCache):
                 node.has_token_been_shared = True
             node = node.parent
 
-    def record_accepted_hit_tokens(self, hit_tokens: int) -> None:
+    def record_accepted_hit_tokens(
+        self, hit_tokens: int, req: Optional[Req] = None
+    ) -> None:
+        _ = req
         if hit_tokens <= 0:
             return
         self.total_accepted_hit_tokens += int(hit_tokens)

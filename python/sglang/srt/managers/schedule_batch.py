@@ -1607,7 +1607,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_cached = pre_len - req.already_computed
                 req.cached_tokens += new_cached
                 if record_accepted_hit_tokens is not None:
-                    record_accepted_hit_tokens(new_cached)
+                    record_accepted_hit_tokens(new_cached, req=req)
 
                 # Calculate detailed breakdown of cached tokens by source (for HiCache)
                 # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
