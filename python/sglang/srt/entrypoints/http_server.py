@@ -650,6 +650,10 @@ def _aggregate_cache_metrics(
     sum_fields = (
         "total_hit_tokens",
         "total_evicted_tokens",
+        "total_generated_tokens",
+        "zombie_token_count",
+        "live_token_count",
+        "live_unshared_token_count",
         "total_evicted_mamba_states",
         "total_generated_checkpoints",
         "total_evicted_checkpoints",
@@ -668,6 +672,11 @@ def _aggregate_cache_metrics(
     zombie_ratio = (zombie / generated) if generated > 0 else 0.0
     aggregate["zombie_state_ratio"] = zombie_ratio
     aggregate["unused_checkpoint_rate"] = zombie_ratio
+    generated_tokens = int(aggregate.get("total_generated_tokens", 0))
+    zombie_tokens = int(aggregate.get("zombie_token_count", 0))
+    aggregate["zombie_token_ratio"] = (
+        zombie_tokens / generated_tokens if generated_tokens > 0 else 0.0
+    )
     return {
         "aggregate": aggregate,
         "per_scheduler": per_scheduler,
