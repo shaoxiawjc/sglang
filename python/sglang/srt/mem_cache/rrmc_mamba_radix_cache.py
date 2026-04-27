@@ -292,6 +292,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         v = node.parent.children.pop(key, None)
         assert v == node, f"Parent does not have RRMC child key, {key}"
 
+        self._on_token_node_evicted(node)
         self.full_evictable_size_ -= len(node.key)
         self.mamba_evictable_size_ -= len(node.mamba_value)
 
@@ -303,6 +304,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         key = self._node_tree_key(node)
         v = node.parent.children.pop(key, None)
         assert v == node, f"Parent does not have RRMC child key, {key}"
+        self._on_token_node_evicted(node)
         self.full_evictable_size_ -= len(node.key)
 
     def _empty_match_result(self) -> MatchResult:
@@ -521,6 +523,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         parent.children[tree_key] = node
         self.full_lru_list.insert_mru(node)
         self.full_evictable_size_ += len(node.value)
+        self._on_token_node_created(node)
         return node
 
     def _ensure_mamba_on_node(self, req: Req, node: TreeNode) -> bool:
