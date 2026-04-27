@@ -120,6 +120,22 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self.total_hit_blocks = 0
         self.total_evicted_blocks = 0
 
+    def record_accepted_hit_tokens(
+        self, hit_tokens: int, req: Optional[Req] = None
+    ) -> None:
+        super().record_accepted_hit_tokens(hit_tokens, req=req)
+        if hit_tokens <= 0 or req is None:
+            return
+        node = getattr(req, "last_node", None)
+        if not isinstance(node, TreeNode) or node is self.root_node:
+            return
+        node.accepted_mamba_hit_count = (
+            int(getattr(node, "accepted_mamba_hit_count", 0)) + 1
+        )
+        while node is not None and node is not self.root_node:
+            node.accepted_hit_count = int(getattr(node, "accepted_hit_count", 0)) + 1
+            node = node.parent
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         req = params.req
         if self.disable or req is None:
@@ -517,6 +533,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
         node.mamba_value = None
         node.last_access_time = get_last_access_time()
         node.hit_count = 1
+        node.accepted_hit_count = 0
+        node.accepted_mamba_hit_count = 0
         node.rrmc_tree_key = tree_key
         node.rrmc_block_identity = segment.block_identity
         node.rrmc_block_id = segment.block_id
@@ -658,17 +676,26 @@ class RRMCMambaRadixCache(MambaRadixCache):
             float(node.last_access_time),
         )
 
-    def _policy_priority(self, node: TreeNode, policy: str) -> tuple[float, ...]:
+    def _policy_priority(
+        self, node: TreeNode, policy: str, *, kind: str = "full"
+    ) -> tuple[float, ...]:
         if policy == "value_aware":
             return self._value_aware_priority(node)
 
         hit_count = float(getattr(node, "hit_count", 0))
+        accepted_hit_count = float(getattr(node, "accepted_hit_count", 0))
+        accepted_mamba_hit_count = float(
+            getattr(node, "accepted_mamba_hit_count", 0)
+        )
         prefix_tokens = float(getattr(node, "rrmc_prefix_tokens", len(node.value)))
         block_tokens = float(getattr(node, "rrmc_block_tokens", len(node.value)))
         last_access = float(node.last_access_time)
 
         if policy == "lfu":
-            return (hit_count, last_access)
+            # RRMC LFU should reflect realized reuse, not lookup attempts.
+            if kind == "mamba":
+                return (accepted_mamba_hit_count, last_access)
+            return (accepted_hit_count, last_access)
         if policy == "gdsf":
             # RRMC-adapted GDSF: use segment recompute cost as the utility term.
             return (hit_count * max(block_tokens, 1.0), last_access)
@@ -739,7 +766,10 @@ class RRMCMambaRadixCache(MambaRadixCache):
             # segment KV ownership is leaf-based today, so we keep full-KV
             # eviction leaf-only and only change the scoring function.
             return self._select_marconi_candidate(candidates, kind="full")
-        return min(candidates, key=lambda node: self._policy_priority(node, policy))
+        return min(
+            candidates,
+            key=lambda node: self._policy_priority(node, policy, kind="full"),
+        )
 
     def _select_mamba_candidate(self, policy: str) -> Optional[TreeNode]:
         candidates = [
@@ -759,7 +789,10 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 return self._select_marconi_candidate(
                     marconi_candidates, kind="mamba"
                 )
-        return min(candidates, key=lambda node: self._policy_priority(node, policy))
+        return min(
+            candidates,
+            key=lambda node: self._policy_priority(node, policy, kind="mamba"),
+        )
 
     def _evict_full_custom(self, num_tokens: int, policy: str) -> int:
         full_num_evicted = 0
