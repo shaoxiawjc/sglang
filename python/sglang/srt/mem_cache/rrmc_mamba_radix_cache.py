@@ -156,14 +156,17 @@ class RRMCMambaRadixCache(MambaRadixCache):
         for node in matched_nodes[:best_value_len]:
             node.hit_count += 1
 
-        self._log_rrmc_stats(
-            hit_blocks=sum(
-                1 for node in matched_nodes[:best_value_len] if node.mamba_value is not None
-            ),
-            hit_tokens=int(best_last_node.rrmc_prefix_tokens),
-            evicted_blocks=0,
-            evicted_tokens=0,
-        )
+        if params.log_stats:
+            self._log_rrmc_stats(
+                hit_blocks=sum(
+                    1
+                    for node in matched_nodes[:best_value_len]
+                    if node.mamba_value is not None
+                ),
+                hit_tokens=int(best_last_node.rrmc_prefix_tokens),
+                evicted_blocks=0,
+                evicted_tokens=0,
+            )
 
         return self._match_post_processor(
             params=params,

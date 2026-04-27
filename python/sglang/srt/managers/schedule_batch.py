@@ -1575,6 +1575,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
+        record_accepted_hit_tokens = getattr(
+            self.tree_cache, "record_accepted_hit_tokens", None
+        )
+        if not callable(record_accepted_hit_tokens):
+            record_accepted_hit_tokens = None
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1601,6 +1606,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed
                 req.cached_tokens += new_cached
+                if record_accepted_hit_tokens is not None:
+                    record_accepted_hit_tokens(new_cached)
 
                 # Calculate detailed breakdown of cached tokens by source (for HiCache)
                 # Only compute once on FIRST chunk - subsequent chunks in chunked prefill

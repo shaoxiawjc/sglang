@@ -649,6 +649,7 @@ def _aggregate_cache_metrics(
     }
     sum_fields = (
         "total_hit_tokens",
+        "total_accepted_hit_tokens",
         "total_evicted_tokens",
         "total_generated_tokens",
         "zombie_token_count",
