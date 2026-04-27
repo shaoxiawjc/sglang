@@ -1296,6 +1296,7 @@ class MambaRadixCache(BasePrefixCache):
 
     def _reset_cache_perf_counters(self) -> None:
         self.total_hit_tokens = 0
+        self.total_accepted_hit_tokens = 0
         self.total_evicted_tokens = 0
         self.total_evicted_mamba_states = 0
         self.total_generated_checkpoints = 0
@@ -1322,6 +1323,11 @@ class MambaRadixCache(BasePrefixCache):
             if node.value is not None:
                 node.has_token_been_shared = True
             node = node.parent
+
+    def record_accepted_hit_tokens(self, hit_tokens: int) -> None:
+        if hit_tokens <= 0:
+            return
+        self.total_accepted_hit_tokens += int(hit_tokens)
 
     def _on_checkpoint_created(self, node: TreeNode) -> None:
         node.is_checkpoint_state = True
@@ -1370,6 +1376,7 @@ class MambaRadixCache(BasePrefixCache):
         return {
             "cache_type": self.__class__.__name__,
             "total_hit_tokens": int(self.total_hit_tokens),
+            "total_accepted_hit_tokens": int(self.total_accepted_hit_tokens),
             "total_evicted_tokens": int(self.total_evicted_tokens),
             "total_evicted_mamba_states": int(self.total_evicted_mamba_states),
             "total_generated_tokens": int(self.total_generated_tokens),
