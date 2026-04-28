@@ -367,6 +367,7 @@ class ServerArgs:
     enable_rrmc_radix_cache: bool = False
     rrmc_radix_eviction_policy: str = "value_aware"
     rrmc_marconi_alpha: float = 1.0
+    rrmc_pgdsf_cost_profile_path: Optional[str] = None
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -4036,6 +4037,16 @@ class ServerArgs:
             help=(
                 "Alpha used by the RRMC 'marconi' eviction policy: "
                 "utility = normalized_recency + alpha * normalized_flop_efficiency."
+            ),
+        )
+        parser.add_argument(
+            "--rrmc-pgdsf-cost-profile-path",
+            type=str,
+            default=ServerArgs.rrmc_pgdsf_cost_profile_path,
+            help=(
+                "Optional JSON profile for RRMC PGDSF cost lookup. The file may "
+                "contain a list or a {'points': [...]} object with cached_tokens, "
+                "non_cached_tokens, and cost/cost_ms/latency_ms fields."
             ),
         )
         parser.add_argument(

@@ -93,6 +93,18 @@ class TreeNode:
         self.hit_count = 0
         self.accepted_hit_count = 0
         self.accepted_mamba_hit_count = 0
+        self.rrmc_full_frequency = 0
+        self.rrmc_mamba_frequency = 0
+        self.rrmc_full_gdsf_priority = 0.0
+        self.rrmc_mamba_gdsf_priority = 0.0
+        self.rrmc_full_pgdsf_priority = 0.0
+        self.rrmc_mamba_pgdsf_priority = 0.0
+        self.rrmc_full_pgdsf_total_cost_per_size = 0.0
+        self.rrmc_mamba_pgdsf_total_cost_per_size = 0.0
+        self.rrmc_full_pgdsf_cost_samples = 0
+        self.rrmc_mamba_pgdsf_cost_samples = 0
+        self.rrmc_full_pgdsf_avg_cost_per_size = 0.0
+        self.rrmc_mamba_pgdsf_avg_cost_per_size = 0.0
         self.host_ref_counter = 0
         self.has_been_shared = False
         self.has_token_been_shared = False
@@ -1106,6 +1118,28 @@ class MambaRadixCache(BasePrefixCache):
         new_node.value = child.value[:split_len].clone()
         new_node.accepted_hit_count = getattr(child, "accepted_hit_count", 0)
         new_node.accepted_mamba_hit_count = 0
+        new_node.rrmc_full_frequency = getattr(child, "rrmc_full_frequency", 0)
+        new_node.rrmc_mamba_frequency = 0
+        new_node.rrmc_full_gdsf_priority = getattr(
+            child, "rrmc_full_gdsf_priority", 0.0
+        )
+        new_node.rrmc_mamba_gdsf_priority = 0.0
+        new_node.rrmc_full_pgdsf_priority = getattr(
+            child, "rrmc_full_pgdsf_priority", 0.0
+        )
+        new_node.rrmc_mamba_pgdsf_priority = 0.0
+        new_node.rrmc_full_pgdsf_total_cost_per_size = getattr(
+            child, "rrmc_full_pgdsf_total_cost_per_size", 0.0
+        )
+        new_node.rrmc_mamba_pgdsf_total_cost_per_size = 0.0
+        new_node.rrmc_full_pgdsf_cost_samples = getattr(
+            child, "rrmc_full_pgdsf_cost_samples", 0
+        )
+        new_node.rrmc_mamba_pgdsf_cost_samples = 0
+        new_node.rrmc_full_pgdsf_avg_cost_per_size = getattr(
+            child, "rrmc_full_pgdsf_avg_cost_per_size", 0.0
+        )
+        new_node.rrmc_mamba_pgdsf_avg_cost_per_size = 0.0
         new_node.has_token_been_shared = getattr(
             child, "has_token_been_shared", False
         )
