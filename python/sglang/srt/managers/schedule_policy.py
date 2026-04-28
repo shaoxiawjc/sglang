@@ -587,6 +587,17 @@ class PrefillAdder:
 
         return min(next_extend_len, req.extend_input_len)
 
+    def _record_rrmc_forced_chunk(
+        self, req: Req, *, extend_len: int, full_extend_len: int
+    ) -> None:
+        record_fn = getattr(self.tree_cache, "record_rrmc_forced_chunk", None)
+        if callable(record_fn):
+            record_fn(
+                req=req,
+                extend_len=int(extend_len),
+                full_extend_len=int(full_extend_len),
+            )
+
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
         _rem_tokens = self._get_dllm_remain_tokens()
@@ -637,6 +648,16 @@ class PrefillAdder:
             target_extend_len = min(req.extend_input_len, _rem_tokens)
 
         truncated = req.extend_input_len > target_extend_len
+        if (
+            truncated
+            and rrmc_next_extend_len is not None
+            and target_extend_len == rrmc_next_extend_len
+        ):
+            self._record_rrmc_forced_chunk(
+                req,
+                extend_len=target_extend_len,
+                full_extend_len=req.extend_input_len,
+            )
         req.set_extend_input_len(target_extend_len)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
@@ -855,6 +876,12 @@ class PrefillAdder:
                     return AddReqResult.OTHER
                 if input_tokens + reserved_new_tokens >= self.rem_total_tokens:
                     return AddReqResult.NO_TOKEN
+                if truncated:
+                    self._record_rrmc_forced_chunk(
+                        req,
+                        extend_len=rrmc_next_extend_len,
+                        full_extend_len=full_extend_len,
+                    )
                 req.set_extend_input_len(rrmc_next_extend_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + rrmc_next_extend_len]
 

@@ -133,6 +133,10 @@ class RRMCMambaRadixCache(MambaRadixCache):
         super()._reset_cache_perf_counters()
         self.total_hit_blocks = 0
         self.total_evicted_blocks = 0
+        self.total_rrmc_forced_chunks = 0
+        self.total_rrmc_created_states = 0
+        self.total_rrmc_accepted_state_hits = 0
+        self.total_rrmc_skipped_cold_boundaries = 0
         self.rrmc_full_gdsf_clock = 0.0
         self.rrmc_mamba_gdsf_clock = 0.0
         self.rrmc_full_pgdsf_clock = 0.0
@@ -403,6 +407,16 @@ class RRMCMambaRadixCache(MambaRadixCache):
         current = float(getattr(self, clock_attr, 0.0))
         setattr(self, clock_attr, max(current, float(evicted_priority)))
 
+    def record_rrmc_forced_chunk(
+        self,
+        *,
+        req: Optional[Req] = None,
+        extend_len: int = 0,
+        full_extend_len: int = 0,
+    ) -> None:
+        _ = (req, extend_len, full_extend_len)
+        self.total_rrmc_forced_chunks += 1
+
     def record_accepted_hit_tokens(
         self, hit_tokens: int, req: Optional[Req] = None
     ) -> None:
@@ -415,6 +429,9 @@ class RRMCMambaRadixCache(MambaRadixCache):
         node.accepted_mamba_hit_count = (
             int(getattr(node, "accepted_mamba_hit_count", 0)) + 1
         )
+        if node.mamba_value is not None:
+            node.has_been_shared = True
+            self.total_rrmc_accepted_state_hits += 1
         self._refresh_rrmc_priority(node, kind="mamba")
         while node is not None and node is not self.root_node:
             node.accepted_hit_count = int(getattr(node, "accepted_hit_count", 0)) + 1
@@ -853,6 +870,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self.mamba_lru_list.insert_mru(node)
         self.mamba_evictable_size_ += len(dst_index)
         self._on_checkpoint_created(node)
+        self.total_rrmc_created_states += 1
         return True
 
     def _get_req_mamba_source(self, req: Req) -> Optional[torch.Tensor]:
@@ -1214,4 +1232,12 @@ class RRMCMambaRadixCache(MambaRadixCache):
         metrics = super().get_cache_metrics()
         metrics["total_hit_blocks"] = int(self.total_hit_blocks)
         metrics["total_evicted_blocks"] = int(self.total_evicted_blocks)
+        metrics["total_rrmc_forced_chunks"] = int(self.total_rrmc_forced_chunks)
+        metrics["total_rrmc_created_states"] = int(self.total_rrmc_created_states)
+        metrics["total_rrmc_accepted_state_hits"] = int(
+            self.total_rrmc_accepted_state_hits
+        )
+        metrics["total_rrmc_skipped_cold_boundaries"] = int(
+            self.total_rrmc_skipped_cold_boundaries
+        )
         return metrics
