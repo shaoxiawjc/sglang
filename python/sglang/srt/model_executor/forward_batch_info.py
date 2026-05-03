@@ -373,6 +373,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For RRMC (RAG Radix Mamba Cache) — pre-computed document segments
     rrmc_segments: Optional[List[Any]] = None
     rrmc_last_linear_layer_id: int = -1
+    rrmc_req: Optional[Any] = None  # The Req with RRMC blocks, for state saving
     # Reference to tree_cache for state saving during forward
     tree_cache: Optional[Any] = None
 
@@ -486,6 +487,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             rids=[req.rid for req in batch.reqs],
             tree_cache=batch.tree_cache,
             rrmc_segments=batch.rrmc_segments,
+            rrmc_req=batch.rrmc_req,
             rrmc_last_linear_layer_id=batch.rrmc_last_linear_layer_id,
         )
         device = model_runner.device

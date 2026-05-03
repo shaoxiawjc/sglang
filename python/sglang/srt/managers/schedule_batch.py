@@ -1291,6 +1291,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For RRMC (RAG Radix Mamba Cache) document-boundary splitting
     rrmc_segments: Optional[List[Any]] = None
+    rrmc_req: Optional[Any] = None
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -1522,6 +1523,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Pre-compute RRMC document segments for operator-level splitting
         self.rrmc_segments = None
         self.rrmc_last_linear_layer_id = -1
+        self.rrmc_req = None
         if self.tree_cache is not None:
             get_req_segments = getattr(self.tree_cache, "_get_req_segments", None)
             if callable(get_req_segments):
@@ -1529,6 +1531,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     segments = get_req_segments(req)
                     if segments and len(segments) > 1:
                         self.rrmc_segments = segments
+                        self.rrmc_req = req
                         self.rrmc_last_linear_layer_id = (
                             self.model_config.num_hidden_layers - 1
                         )
@@ -2373,6 +2376,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             tree_cache=self.tree_cache,
             rrmc_segments=self.rrmc_segments,
+            rrmc_req=self.rrmc_req,
             rrmc_last_linear_layer_id=self.rrmc_last_linear_layer_id,
         )
 
@@ -2572,4 +2576,5 @@ class ModelWorkerBatch:
     # For RRMC (RAG Radix Mamba Cache)
     tree_cache: Optional[Any] = None
     rrmc_segments: Optional[List[Any]] = None
+    rrmc_req: Optional[Any] = None
     rrmc_last_linear_layer_id: int = -1

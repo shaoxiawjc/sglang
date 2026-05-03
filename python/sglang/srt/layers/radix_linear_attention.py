@@ -75,8 +75,18 @@ def _setup_segment_fb(
 
     if is_last:
         forward_batch.mamba_track_mask = orig["mamba_track_mask"]
-        forward_batch.mamba_track_seqlens = orig["mamba_track_seqlens"]
         forward_batch.mamba_track_indices = orig["mamba_track_indices"]
+        # mamba_track_seqlens must match the per-segment view:
+        # seq_len = extend_seq_lens + extend_prefix_lens = seg_len + prefix_lens
+        if orig["mamba_track_seqlens"] is not None:
+            if seg_idx == 0:
+                forward_batch.mamba_track_seqlens = orig["mamba_track_seqlens"]
+            else:
+                forward_batch.mamba_track_seqlens = torch.tensor(
+                    [seg_len + forward_batch.extend_prefix_lens.item()],
+                    dtype=orig["mamba_track_seqlens"].dtype,
+                    device=device,
+                )
     else:
         if orig["mamba_track_mask"] is not None:
             forward_batch.mamba_track_mask = torch.zeros_like(orig["mamba_track_mask"])
@@ -177,13 +187,14 @@ class RadixLinearAttention(nn.Module):
                 if tree_cache is not None:
                     cache_seg = getattr(tree_cache, "cache_segment_state", None)
                     if callable(cache_seg):
-                        context = get_forward_context()
-                        if context is not None and context.reqs:
-                            cache_seg(
-                                context.reqs[0],
-                                segs,
-                                forward_batch.req_to_token_pool,
-                            )
+                        # Pass only segments up to the current one so state is
+                        # saved for the segment that just completed.
+                        completed_segs = segs[: seg_idx + 1]
+                        cache_seg(
+                            forward_batch.rrmc_req,
+                            completed_segs,
+                            forward_batch.req_to_token_pool,
+                        )
 
         _restore_fb_state(forward_batch, orig_state)
         return torch.cat(seg_outputs, dim=1)
