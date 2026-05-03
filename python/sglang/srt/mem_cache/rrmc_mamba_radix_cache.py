@@ -417,6 +417,54 @@ class RRMCMambaRadixCache(MambaRadixCache):
         _ = (req, extend_len, full_extend_len)
         self.total_rrmc_forced_chunks += 1
 
+    def cache_segment_state(
+        self,
+        req: Req,
+        segments: list,
+        req_to_token_pool,
+    ) -> None:
+        """Save mamba state for a completed segment during forward pass.
+
+        Called from RadixLinearAttention.forward() at the last linear-attention
+        layer after a non-final segment completes.  Walks/creates tree nodes
+        for all cacheable segments up to the last one and forks the current
+        mamba state onto the terminal node.
+        """
+        if self.disable or not segments:
+            return
+
+        last_seg = segments[-1]
+        cacheable = self._get_cacheable_prefix_segments(req, last_seg.end)
+        if not cacheable:
+            return
+
+        token_ids = req.origin_input_ids
+        kv_indices = req_to_token_pool.req_to_token[
+            req.req_pool_idx, : last_seg.end
+        ]
+        extra_key = req.extra_key
+
+        node = self.root_node
+        for seg in cacheable:
+            tree_key = self._make_tree_key(node, extra_key, seg)
+            child = node.children.get(tree_key)
+            if child is None:
+                child = self._new_segment_node(
+                    parent=node,
+                    tree_key=tree_key,
+                    segment=seg,
+                    token_ids=token_ids[seg.start : seg.end],
+                    kv_values=kv_indices[seg.start : seg.end].clone(),
+                    extra_key=extra_key,
+                )
+            else:
+                child.last_access_time = get_last_access_time()
+                self.full_lru_list.reset_node_mru(child)
+            node = child
+
+        self._ensure_mamba_on_node(req, node)
+        self.total_rrmc_created_states += 1
+
     def record_accepted_hit_tokens(
         self, hit_tokens: int, req: Optional[Req] = None
     ) -> None:
@@ -515,7 +563,6 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 token_ids=req.origin_input_ids,
                 kv_indices=kv_indices,
                 duplicate_free_from=req.cache_protected_len,
-                chunked=False,
             )
 
         self._free_req_kv(req, max(req.cache_protected_len, cached_len), kv_committed_len)
@@ -523,6 +570,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False) -> None:
+        # chunked is no longer used in v2 (forward handles segment splitting); accepted for compat.
         token_ids = req.fill_ids
         if self.disable:
             return self._skip_cache_unfinished_req(req, len(token_ids))
@@ -540,7 +588,6 @@ class RRMCMambaRadixCache(MambaRadixCache):
             token_ids=token_ids,
             kv_indices=kv_indices_orig,
             duplicate_free_from=req.cache_protected_len,
-            chunked=chunked,
         )
 
         if canonical_len <= req.cache_protected_len:
@@ -645,19 +692,9 @@ class RRMCMambaRadixCache(MambaRadixCache):
             return 0
         return min(track_limit, len(req.origin_input_ids))
 
-    def rrmc_next_extend_len(self, req: Req) -> Optional[int]:
-        block_specs = self._get_cacheable_blocks(req)
-        if not block_specs:
-            return None
-
-        prefix_len = len(req.prefix_indices)
-        for block in block_specs:
-            if block.end > prefix_len:
-                return block.end - prefix_len
-        return None
-
-    def rrmc_disable_operator_chunk_state_tracking(self, req: Req) -> bool:
-        return self._get_cacheable_blocks(req) is not None
+    # rrmc_next_extend_len and rrmc_disable_operator_chunk_state_tracking removed.
+    # In v2, document-boundary splitting is handled in the forward pass,
+    # not by the scheduler.
 
     def _get_req_blocks(self, req: Req) -> Optional[list[RRMCBlockSpec]]:
         cached = getattr(req, "_rrmc_block_specs_cache", None)
@@ -889,9 +926,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         token_ids: list[int],
         kv_indices: torch.Tensor,
         duplicate_free_from: int,
-        chunked: bool,
     ) -> tuple[int, TreeNode]:
-        del chunked  # RRMC counts explicit matches, not token-level chunk hits.
 
         node = self.root_node
         extra_key = req.extra_key

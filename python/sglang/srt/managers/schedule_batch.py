@@ -1289,6 +1289,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
 
+    # For RRMC (RAG Radix Mamba Cache) document-boundary splitting
+    rrmc_segments: Optional[List[Any]] = None
+
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
 
@@ -1515,6 +1518,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
+
+        # Pre-compute RRMC document segments for operator-level splitting
+        self.rrmc_segments = None
+        self.rrmc_last_linear_layer_id = -1
+        if self.tree_cache is not None:
+            get_req_segments = getattr(self.tree_cache, "_get_req_segments", None)
+            if callable(get_req_segments):
+                for req in reqs:
+                    segments = get_req_segments(req)
+                    if segments and len(segments) > 1:
+                        self.rrmc_segments = segments
+                        self.rrmc_last_linear_layer_id = (
+                            self.model_config.num_hidden_layers - 1
+                        )
+                        break
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
@@ -2353,6 +2371,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            tree_cache=self.tree_cache,
+            rrmc_segments=self.rrmc_segments,
+            rrmc_last_linear_layer_id=self.rrmc_last_linear_layer_id,
         )
 
     def copy(self):
@@ -2547,3 +2568,8 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # For RRMC (RAG Radix Mamba Cache)
+    tree_cache: Optional[Any] = None
+    rrmc_segments: Optional[List[Any]] = None
+    rrmc_last_linear_layer_id: int = -1

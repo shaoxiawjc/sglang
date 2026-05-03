@@ -370,6 +370,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
 
+    # For RRMC (RAG Radix Mamba Cache) — pre-computed document segments
+    rrmc_segments: Optional[List[Any]] = None
+    rrmc_last_linear_layer_id: int = -1
+    # Reference to tree_cache for state saving during forward
+    tree_cache: Optional[Any] = None
+
     # For DP attention
     original_global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_cpu: Optional[List[int]] = None
@@ -478,6 +484,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
+            tree_cache=batch.tree_cache,
+            rrmc_segments=batch.rrmc_segments,
+            rrmc_last_linear_layer_id=batch.rrmc_last_linear_layer_id,
         )
         device = model_runner.device
 
