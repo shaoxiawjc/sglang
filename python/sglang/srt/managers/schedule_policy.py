@@ -411,7 +411,7 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
-        self.new_chunked_reqs = []
+        self.new_chunked_req = None
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
@@ -569,35 +569,6 @@ class PrefillAdder:
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
 
-    def _get_rrmc_next_extend_len(self, req: Req) -> Optional[int]:
-        if self.rem_chunk_tokens is None:
-            return None
-
-        next_extend_len_fn = getattr(self.tree_cache, "rrmc_next_extend_len", None)
-        if next_extend_len_fn is None:
-            return None
-
-        next_extend_len = next_extend_len_fn(req)
-        if next_extend_len is None:
-            return None
-
-        next_extend_len = int(next_extend_len)
-        if next_extend_len <= 0:
-            return None
-
-        return min(next_extend_len, req.extend_input_len)
-
-    def _record_rrmc_forced_chunk(
-        self, req: Req, *, extend_len: int, full_extend_len: int
-    ) -> None:
-        record_fn = getattr(self.tree_cache, "record_rrmc_forced_chunk", None)
-        if callable(record_fn):
-            record_fn(
-                req=req,
-                extend_len=int(extend_len),
-                full_extend_len=int(full_extend_len),
-            )
-
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
         _rem_tokens = self._get_dllm_remain_tokens()
@@ -636,29 +607,8 @@ class PrefillAdder:
             if _rem_tokens <= 0:
                 _rem_tokens = self.rem_chunk_tokens
 
-        rrmc_next_extend_len = self._get_rrmc_next_extend_len(req)
-        if rrmc_next_extend_len is not None:
-            if _rem_tokens <= 0:
-                return req
-            if rrmc_next_extend_len <= _rem_tokens:
-                target_extend_len = rrmc_next_extend_len
-            else:
-                target_extend_len = min(req.extend_input_len, _rem_tokens)
-        else:
-            target_extend_len = min(req.extend_input_len, _rem_tokens)
-
-        truncated = req.extend_input_len > target_extend_len
-        if (
-            truncated
-            and rrmc_next_extend_len is not None
-            and target_extend_len == rrmc_next_extend_len
-        ):
-            self._record_rrmc_forced_chunk(
-                req,
-                extend_len=target_extend_len,
-                full_extend_len=req.extend_input_len,
-            )
-        req.set_extend_input_len(target_extend_len)
+        truncated = req.extend_input_len > _rem_tokens
+        req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -771,7 +721,7 @@ class PrefillAdder:
             req.set_extend_input_len(trunc_len)
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
-            self.new_chunked_reqs.append(req)
+            self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0)
 
         return self.budget_state()
@@ -802,29 +752,13 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        planned_rrmc_extend_len = self._get_rrmc_next_extend_len(req)
-        if (
-            planned_rrmc_extend_len is not None
-            and self.rem_chunk_tokens is not None
-            and planned_rrmc_extend_len > self.rem_chunk_tokens
-        ):
-            planned_rrmc_extend_len = None
-        planned_extend_len = (
-            planned_rrmc_extend_len
-            if planned_rrmc_extend_len is not None
-            else req.extend_input_len
-        )
-        total_tokens = planned_extend_len + (
-            0
-            if planned_extend_len < req.extend_input_len
-            else min(
-                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-                CLIP_MAX_NEW_TOKENS,
-            )
+        total_tokens = req.extend_input_len + min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = planned_extend_len - req.host_hit_length
+        real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
@@ -851,50 +785,6 @@ class PrefillAdder:
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
-
-            rrmc_next_extend_len = self._get_rrmc_next_extend_len(req)
-            if (
-                rrmc_next_extend_len is not None
-                and (
-                    self.rem_chunk_tokens is None
-                    or rrmc_next_extend_len <= self.rem_chunk_tokens
-                )
-            ):
-                input_tokens = self.ceil_paged_tokens(rrmc_next_extend_len)
-                full_extend_len = req.extend_input_len
-                truncated = rrmc_next_extend_len < full_extend_len
-                reserved_new_tokens = (
-                    0
-                    if truncated
-                    else min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
-                    )
-                )
-
-                if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
-                    return AddReqResult.OTHER
-                if input_tokens + reserved_new_tokens >= self.rem_total_tokens:
-                    return AddReqResult.NO_TOKEN
-                if truncated:
-                    self._record_rrmc_forced_chunk(
-                        req,
-                        extend_len=rrmc_next_extend_len,
-                        full_extend_len=full_extend_len,
-                    )
-                req.set_extend_input_len(rrmc_next_extend_len)
-                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + rrmc_next_extend_len]
-
-                self.can_run_list.append(req)
-                if truncated:
-                    self.new_chunked_reqs.append(req)
-                self._req_inc_lock_ref(req)
-                self._update_prefill_budget(
-                    prefix_len,
-                    input_tokens,
-                    reserved_new_tokens,
-                )
-                return self.budget_state()
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
@@ -942,15 +832,12 @@ class PrefillAdder:
                             trunc_len // truncation_align_size
                         )
 
-                if has_chunked_req or self.new_chunked_reqs:
-                    return AddReqResult.OTHER
-
                 # Chunked prefill
                 req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
                 self.can_run_list.append(req)
-                self.new_chunked_reqs.append(req)
+                self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)

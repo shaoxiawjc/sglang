@@ -1266,9 +1266,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    # For unfinished chunked prefill requests tracked across batches.
+    # For chunked prefill in PP
     chunked_req: Optional[Req] = None
-    chunked_reqs: Optional[List[Req]] = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -1389,7 +1388,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
-        chunked_reqs: Optional[List[Req]] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1397,12 +1395,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         is_hybrid_swa = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             is_hybrid_swa = True
-
-        resolved_chunked_reqs = (
-            list(chunked_reqs)
-            if chunked_reqs is not None
-            else ([chunked_req] if chunked_req is not None else [])
-        )
 
         return cls(
             reqs=reqs,
@@ -1420,8 +1412,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
-            chunked_req=resolved_chunked_reqs[0] if resolved_chunked_reqs else None,
-            chunked_reqs=resolved_chunked_reqs,
+            chunked_req=chunked_req,
             dllm_config=dllm_config,
         )
 
@@ -1575,11 +1566,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
-        record_accepted_hit_tokens = getattr(
-            self.tree_cache, "record_accepted_hit_tokens", None
-        )
-        if not callable(record_accepted_hit_tokens):
-            record_accepted_hit_tokens = None
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1606,7 +1592,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed
                 req.cached_tokens += new_cached
-                if record_accepted_hit_tokens is not None:
+
+                record_accepted_hit_tokens = getattr(
+                    self.tree_cache, "record_accepted_hit_tokens", None
+                )
+                if callable(record_accepted_hit_tokens):
                     record_accepted_hit_tokens(new_cached, req=req)
 
                 # Calculate detailed breakdown of cached tokens by source (for HiCache)
@@ -1776,21 +1766,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
-
-        disable_rrmc_tracking_fn = getattr(
-            self.tree_cache, "rrmc_disable_operator_chunk_state_tracking", None
-        )
-        if (
-            callable(disable_rrmc_tracking_fn)
-            and disable_rrmc_tracking_fn(req)
-        ):
-            mamba_track_mask_cpu.append(False)
-            mamba_track_indices_cpu.append(
-                req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
-            )
-            req.mamba_last_track_seqlen = None
-            mamba_track_seqlens_cpu.append(-1)
-            return
 
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
         mask = req.extend_input_len >= mamba_cache_chunk_size
