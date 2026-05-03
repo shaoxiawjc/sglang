@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 _FB_SEGMENT_FIELDS = (
     "extend_seq_lens",
+    "extend_seq_lens_cpu",
     "extend_start_loc",
     "extend_prefix_lens",
     "mamba_track_mask",
@@ -62,6 +63,7 @@ def _setup_segment_fb(
     forward_batch.extend_seq_lens = torch.tensor(
         [seg_len], dtype=orig["extend_seq_lens"].dtype, device=device
     )
+    forward_batch.extend_seq_lens_cpu = [seg_len]
     forward_batch.extend_start_loc = torch.tensor(
         [0], dtype=orig["extend_start_loc"].dtype, device=device
     )
