@@ -63,7 +63,7 @@ def _setup_segment_fb(
         [seg_len], dtype=orig["extend_seq_lens"].dtype, device=device
     )
     forward_batch.extend_start_loc = torch.tensor(
-        [0, seg_len], dtype=orig["extend_start_loc"].dtype, device=device
+        [0], dtype=orig["extend_start_loc"].dtype, device=device
     )
 
     if seg_idx == 0:
