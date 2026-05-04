@@ -162,20 +162,42 @@ class RadixLinearAttention(nn.Module):
 
         # Multi-segment RRMC path: process per-document sequentially,
         # reusing mamba state across segments via in-place pool updates.
+        # rrmc_segments are pre-computed from the full request, but the
+        # current extend may only cover a prefix (chunked prefill). Skip
+        # segments beyond the current input and truncate the final one.
         seg_outputs = []
         orig_state = _save_fb_state(forward_batch)
         last_linear_layer_id = self._get_last_linear_layer_id(forward_batch)
+        total_tokens = mixed_qkv.shape[0]
 
-        for seg_idx, seg in enumerate(segs):
-            is_last_seg = (seg_idx == len(segs) - 1)
-            seg_len = seg.end - seg.start
+        segs_in_bounds = []
+        for seg in segs:
+            if seg.start >= total_tokens:
+                break
+            segs_in_bounds.append(seg)
+        if not segs_in_bounds:
+            return self._forward_once(forward_batch, mixed_qkv, a, b)
 
-            seg_mixed_qkv = mixed_qkv[seg.start:seg.end]
-            seg_a = a[seg.start:seg.end]
-            seg_b = b[seg.start:seg.end]
+        for seg_idx, seg in enumerate(segs_in_bounds):
+            seg_end = min(seg.end, total_tokens)
+            seg_len = seg_end - seg.start
+            is_last_seg = (
+                seg_idx == len(segs_in_bounds) - 1 and seg_end == seg.end
+            )
+            is_final_for_chunk = (
+                seg_idx == len(segs_in_bounds) - 1 and seg_end < seg.end
+            )
+
+            seg_mixed_qkv = mixed_qkv[seg.start:seg_end]
+            seg_a = a[seg.start:seg_end]
+            seg_b = b[seg.start:seg_end]
 
             _setup_segment_fb(
-                forward_batch, seg_idx, seg_len, is_last_seg, orig_state
+                forward_batch,
+                seg_idx,
+                seg_len,
+                is_last_seg or is_final_for_chunk,
+                orig_state,
             )
             _reinit_linear_attn_metadata(forward_batch)
 
@@ -184,14 +206,14 @@ class RadixLinearAttention(nn.Module):
             )
             seg_outputs.append(seg_output)
 
-            if not is_last_seg and self.layer_id == last_linear_layer_id:
+            # Only cache state when the segment completes at its natural
+            # boundary (not truncated by chunked-prefill limits).
+            if not is_last_seg and not is_final_for_chunk and self.layer_id == last_linear_layer_id:
                 tree_cache = getattr(forward_batch, "tree_cache", None)
                 if tree_cache is not None:
                     cache_seg = getattr(tree_cache, "cache_segment_state", None)
                     if callable(cache_seg):
-                        # Pass only segments up to the current one so state is
-                        # saved for the segment that just completed.
-                        completed_segs = segs[: seg_idx + 1]
+                        completed_segs = segs_in_bounds[: seg_idx + 1]
                         cache_seg(
                             forward_batch.rrmc_req,
                             completed_segs,
