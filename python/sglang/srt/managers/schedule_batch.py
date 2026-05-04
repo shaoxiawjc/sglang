@@ -1290,6 +1290,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
 
+    # RRMC operator-boundary state capture metadata
+    rrmc_enabled: bool = False
+    rrmc_boundary_req_indices: Optional[torch.Tensor] = None
+    rrmc_boundary_block_ends: Optional[torch.Tensor] = None
+    rrmc_boundary_local_starts: Optional[torch.Tensor] = None
+    rrmc_boundary_local_ends: Optional[torch.Tensor] = None
+    rrmc_boundary_mamba_indices: Optional[torch.Tensor] = None
+    rrmc_boundary_req_indices_cpu: Optional[List[int]] = None
+    rrmc_boundary_block_ends_cpu: Optional[List[int]] = None
+    rrmc_boundary_local_starts_cpu: Optional[List[int]] = None
+    rrmc_boundary_local_ends_cpu: Optional[List[int]] = None
+    rrmc_boundary_mamba_indices_cpu: Optional[List[int]] = None
+
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
 
@@ -1567,6 +1580,56 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
             self
         )
+
+        self.rrmc_enabled = False
+        self.rrmc_boundary_req_indices = None
+        self.rrmc_boundary_block_ends = None
+        self.rrmc_boundary_local_starts = None
+        self.rrmc_boundary_local_ends = None
+        self.rrmc_boundary_mamba_indices = None
+        self.rrmc_boundary_req_indices_cpu = None
+        self.rrmc_boundary_block_ends_cpu = None
+        self.rrmc_boundary_local_starts_cpu = None
+        self.rrmc_boundary_local_ends_cpu = None
+        self.rrmc_boundary_mamba_indices_cpu = None
+
+        prepare_rrmc_boundaries = getattr(
+            self.tree_cache, "prepare_rrmc_forward_boundaries", None
+        )
+        if callable(prepare_rrmc_boundaries):
+            rrmc_boundaries = prepare_rrmc_boundaries(reqs, prefix_lens, extend_lens)
+            if rrmc_boundaries is not None and rrmc_boundaries.boundaries:
+                self.rrmc_enabled = True
+                self.rrmc_boundary_req_indices_cpu = rrmc_boundaries.req_indices
+                self.rrmc_boundary_block_ends_cpu = rrmc_boundaries.block_ends
+                self.rrmc_boundary_local_starts_cpu = rrmc_boundaries.local_starts
+                self.rrmc_boundary_local_ends_cpu = rrmc_boundaries.local_ends
+                self.rrmc_boundary_mamba_indices_cpu = rrmc_boundaries.mamba_indices
+                self.rrmc_boundary_req_indices = torch.tensor(
+                    self.rrmc_boundary_req_indices_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self.rrmc_boundary_block_ends = torch.tensor(
+                    self.rrmc_boundary_block_ends_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self.rrmc_boundary_local_starts = torch.tensor(
+                    self.rrmc_boundary_local_starts_cpu,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.rrmc_boundary_local_ends = torch.tensor(
+                    self.rrmc_boundary_local_ends_cpu,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.rrmc_boundary_mamba_indices = torch.tensor(
+                    self.rrmc_boundary_mamba_indices_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
 
         # Set fields
         input_embeds = []
@@ -2378,6 +2441,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            rrmc_enabled=self.rrmc_enabled,
+            rrmc_boundary_req_indices=self.rrmc_boundary_req_indices,
+            rrmc_boundary_block_ends=self.rrmc_boundary_block_ends,
+            rrmc_boundary_local_starts=self.rrmc_boundary_local_starts,
+            rrmc_boundary_local_ends=self.rrmc_boundary_local_ends,
+            rrmc_boundary_mamba_indices=self.rrmc_boundary_mamba_indices,
+            rrmc_boundary_req_indices_cpu=self.rrmc_boundary_req_indices_cpu,
+            rrmc_boundary_block_ends_cpu=self.rrmc_boundary_block_ends_cpu,
+            rrmc_boundary_local_starts_cpu=self.rrmc_boundary_local_starts_cpu,
+            rrmc_boundary_local_ends_cpu=self.rrmc_boundary_local_ends_cpu,
+            rrmc_boundary_mamba_indices_cpu=self.rrmc_boundary_mamba_indices_cpu,
         )
 
     def copy(self):
@@ -2572,3 +2646,16 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # RRMC operator-boundary state capture metadata
+    rrmc_enabled: bool = False
+    rrmc_boundary_req_indices: Optional[torch.Tensor] = None
+    rrmc_boundary_block_ends: Optional[torch.Tensor] = None
+    rrmc_boundary_local_starts: Optional[torch.Tensor] = None
+    rrmc_boundary_local_ends: Optional[torch.Tensor] = None
+    rrmc_boundary_mamba_indices: Optional[torch.Tensor] = None
+    rrmc_boundary_req_indices_cpu: Optional[List[int]] = None
+    rrmc_boundary_block_ends_cpu: Optional[List[int]] = None
+    rrmc_boundary_local_starts_cpu: Optional[List[int]] = None
+    rrmc_boundary_local_ends_cpu: Optional[List[int]] = None
+    rrmc_boundary_mamba_indices_cpu: Optional[List[int]] = None

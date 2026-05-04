@@ -372,6 +372,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
+        if (
+            not is_target_verify
+            and getattr(forward_batch, "rrmc_enabled", False)
+            and forward_batch.rrmc_boundary_local_ends_cpu
+        ):
+            return self._forward_extend_rrmc_boundaries(
+                layer=layer,
+                forward_batch=forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+            )
+
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
@@ -470,3 +486,203 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
         return core_attn_out
+
+    def _forward_extend_rrmc_boundaries(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_len = mixed_qkv.shape[0]
+        core_attn_out = mixed_qkv.new_zeros(
+            1, seq_len, layer.num_v_heads, layer.head_v_dim
+        )
+
+        boundaries_by_req: dict[int, list[tuple[int, int, int]]] = {}
+        for req_idx, local_start, local_end, mamba_idx in zip(
+            forward_batch.rrmc_boundary_req_indices_cpu,
+            forward_batch.rrmc_boundary_local_starts_cpu,
+            forward_batch.rrmc_boundary_local_ends_cpu,
+            forward_batch.rrmc_boundary_mamba_indices_cpu,
+        ):
+            boundaries_by_req.setdefault(int(req_idx), []).append(
+                (int(local_start), int(local_end), int(mamba_idx))
+            )
+        for req_boundaries in boundaries_by_req.values():
+            req_boundaries.sort(key=lambda item: item[1])
+
+        req_start = 0
+        for req_idx, req_extend_len in enumerate(forward_batch.extend_seq_lens_cpu):
+            req_end = req_start + int(req_extend_len)
+            segment_start = req_start
+            req_boundaries = boundaries_by_req.get(req_idx, [])
+            has_initial_state = (
+                int(forward_batch.extend_prefix_lens_cpu[req_idx]) > 0
+            )
+
+            for boundary_start, boundary_end, boundary_mamba_idx in req_boundaries:
+                if boundary_start > segment_start:
+                    self._run_rrmc_prefill_segment(
+                        layer=layer,
+                        mixed_qkv=mixed_qkv,
+                        a=a,
+                        b=b,
+                        conv_states=conv_states,
+                        ssm_states=ssm_states,
+                        cache_indices=cache_indices,
+                        req_idx=req_idx,
+                        segment_start=segment_start,
+                        segment_end=boundary_start,
+                        has_initial_state=has_initial_state,
+                        core_attn_out=core_attn_out,
+                    )
+                    has_initial_state = True
+                    segment_start = boundary_start
+
+                if boundary_end > segment_start:
+                    self._run_rrmc_prefill_segment(
+                        layer=layer,
+                        mixed_qkv=mixed_qkv,
+                        a=a,
+                        b=b,
+                        conv_states=conv_states,
+                        ssm_states=ssm_states,
+                        cache_indices=cache_indices,
+                        req_idx=req_idx,
+                        segment_start=segment_start,
+                        segment_end=boundary_end,
+                        has_initial_state=has_initial_state,
+                        core_attn_out=core_attn_out,
+                    )
+                    self._capture_rrmc_boundary_state(
+                        conv_states=conv_states,
+                        ssm_states=ssm_states,
+                        cache_indices=cache_indices,
+                        req_idx=req_idx,
+                        boundary_mamba_idx=boundary_mamba_idx,
+                    )
+                    has_initial_state = True
+                    segment_start = boundary_end
+
+            if segment_start < req_end:
+                self._run_rrmc_prefill_segment(
+                    layer=layer,
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    conv_states=conv_states,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    req_idx=req_idx,
+                    segment_start=segment_start,
+                    segment_end=req_end,
+                    has_initial_state=has_initial_state,
+                    core_attn_out=core_attn_out,
+                )
+
+            req_start = req_end
+
+        return core_attn_out
+
+    def _run_rrmc_prefill_segment(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        req_idx: int,
+        segment_start: int,
+        segment_end: int,
+        has_initial_state: bool,
+        core_attn_out: torch.Tensor,
+    ) -> None:
+        segment_len = int(segment_end - segment_start)
+        if segment_len <= 0:
+            return
+
+        segment_cache_indices = cache_indices[req_idx : req_idx + 1]
+        segment_query_start_loc = torch.tensor(
+            [0, segment_len],
+            dtype=torch.int32,
+            device=mixed_qkv.device,
+        )
+        segment_has_initial_state = torch.tensor(
+            [has_initial_state],
+            dtype=torch.bool,
+            device=mixed_qkv.device,
+        )
+
+        segment_mixed_qkv = mixed_qkv[segment_start:segment_end].transpose(0, 1)
+        segment_mixed_qkv = causal_conv1d_fn(
+            segment_mixed_qkv,
+            layer.conv_weights,
+            layer.bias,
+            activation=layer.activation,
+            conv_states=conv_states,
+            has_initial_state=segment_has_initial_state,
+            cache_indices=segment_cache_indices,
+            query_start_loc=segment_query_start_loc,
+            seq_lens_cpu=[segment_len],
+        ).transpose(0, 1)[:segment_len]
+
+        query, key, value = torch.split(
+            segment_mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+        query = query.view(1, segment_len, layer.num_q_heads, layer.head_q_dim)
+        key = key.view(1, segment_len, layer.num_k_heads, layer.head_k_dim)
+        value = value.view(1, segment_len, layer.num_v_heads, layer.head_v_dim)
+
+        g, beta = fused_gdn_gating(
+            layer.A_log,
+            a[segment_start:segment_end],
+            b[segment_start:segment_end],
+            layer.dt_bias,
+        )
+        segment_out, last_recurrent_state, _ = self.kernel_dispatcher.extend(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            ssm_states=ssm_states,
+            cache_indices=segment_cache_indices,
+            query_start_loc=segment_query_start_loc,
+        )
+
+        if (is_npu() or is_cpu()) and last_recurrent_state is not None:
+            last_recurrent_state = last_recurrent_state.to(
+                ssm_states.dtype, copy=False
+            )
+            ssm_states[segment_cache_indices] = last_recurrent_state
+
+        core_attn_out[:, segment_start:segment_end] = segment_out
+
+    def _capture_rrmc_boundary_state(
+        self,
+        *,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        req_idx: int,
+        boundary_mamba_idx: int,
+    ) -> None:
+        src_index = cache_indices[req_idx : req_idx + 1].to(dtype=torch.long)
+        dst_index = torch.tensor(
+            [boundary_mamba_idx],
+            dtype=torch.long,
+            device=cache_indices.device,
+        )
+        conv_states[dst_index] = conv_states[src_index]
+        ssm_states[dst_index] = ssm_states[src_index]

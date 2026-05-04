@@ -704,6 +704,92 @@ class TboForwardBatchPreparer:
             "orig_seq_lens",  # only used by qwen-1m, thus not care
         ]:
             output_dict[key] = getattr(batch, key)
+
+        rrmc_boundary_req_indices_cpu = []
+        rrmc_boundary_block_ends_cpu = []
+        rrmc_boundary_local_starts_cpu = []
+        rrmc_boundary_local_ends_cpu = []
+        rrmc_boundary_mamba_indices_cpu = []
+        if batch.rrmc_enabled and batch.rrmc_boundary_req_indices_cpu:
+            for req_idx, block_end, local_start, local_end, mamba_idx in zip(
+                batch.rrmc_boundary_req_indices_cpu,
+                batch.rrmc_boundary_block_ends_cpu,
+                batch.rrmc_boundary_local_starts_cpu,
+                batch.rrmc_boundary_local_ends_cpu,
+                batch.rrmc_boundary_mamba_indices_cpu,
+            ):
+                if not (start_seq_index <= req_idx < end_seq_index):
+                    continue
+                assert start_token_index <= local_start < local_end <= end_token_index
+                rrmc_boundary_req_indices_cpu.append(req_idx - start_seq_index)
+                rrmc_boundary_block_ends_cpu.append(block_end)
+                rrmc_boundary_local_starts_cpu.append(local_start - start_token_index)
+                rrmc_boundary_local_ends_cpu.append(local_end - start_token_index)
+                rrmc_boundary_mamba_indices_cpu.append(mamba_idx)
+
+        rrmc_enabled = bool(rrmc_boundary_req_indices_cpu)
+        output_dict["rrmc_enabled"] = rrmc_enabled
+        output_dict["rrmc_boundary_req_indices_cpu"] = (
+            rrmc_boundary_req_indices_cpu if rrmc_enabled else None
+        )
+        output_dict["rrmc_boundary_block_ends_cpu"] = (
+            rrmc_boundary_block_ends_cpu if rrmc_enabled else None
+        )
+        output_dict["rrmc_boundary_local_starts_cpu"] = (
+            rrmc_boundary_local_starts_cpu if rrmc_enabled else None
+        )
+        output_dict["rrmc_boundary_local_ends_cpu"] = (
+            rrmc_boundary_local_ends_cpu if rrmc_enabled else None
+        )
+        output_dict["rrmc_boundary_mamba_indices_cpu"] = (
+            rrmc_boundary_mamba_indices_cpu if rrmc_enabled else None
+        )
+        output_dict["rrmc_boundary_req_indices"] = (
+            torch.tensor(
+                rrmc_boundary_req_indices_cpu,
+                dtype=torch.int64,
+                device=batch.input_ids.device,
+            )
+            if rrmc_enabled
+            else None
+        )
+        output_dict["rrmc_boundary_block_ends"] = (
+            torch.tensor(
+                rrmc_boundary_block_ends_cpu,
+                dtype=torch.int64,
+                device=batch.input_ids.device,
+            )
+            if rrmc_enabled
+            else None
+        )
+        output_dict["rrmc_boundary_local_starts"] = (
+            torch.tensor(
+                rrmc_boundary_local_starts_cpu,
+                dtype=torch.int32,
+                device=batch.input_ids.device,
+            )
+            if rrmc_enabled
+            else None
+        )
+        output_dict["rrmc_boundary_local_ends"] = (
+            torch.tensor(
+                rrmc_boundary_local_ends_cpu,
+                dtype=torch.int32,
+                device=batch.input_ids.device,
+            )
+            if rrmc_enabled
+            else None
+        )
+        output_dict["rrmc_boundary_mamba_indices"] = (
+            torch.tensor(
+                rrmc_boundary_mamba_indices_cpu,
+                dtype=torch.int64,
+                device=batch.input_ids.device,
+            )
+            if rrmc_enabled
+            else None
+        )
+
         if not batch.forward_mode.is_target_verify():
             assert (
                 _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)
