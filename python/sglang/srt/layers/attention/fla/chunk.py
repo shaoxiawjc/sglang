@@ -35,6 +35,8 @@ def chunk_gated_delta_rule_fwd(
     initial_state_indices: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
+    rrmc_boundary_state_indices_by_chunk: Optional[torch.Tensor] = None,
+    rrmc_boundary_token_offsets_by_chunk: Optional[torch.Tensor] = None,
 ):
     g = chunk_local_cumsum(g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens)
 
@@ -55,6 +57,8 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        rrmc_boundary_state_indices_by_chunk=rrmc_boundary_state_indices_by_chunk,
+        rrmc_boundary_token_offsets_by_chunk=rrmc_boundary_token_offsets_by_chunk,
         cu_seqlens=cu_seqlens,
     )
     o = chunk_fwd_o(
@@ -89,6 +93,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         initial_state_indices: torch.Tensor,
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
+        rrmc_boundary_state_indices_by_chunk: Optional[torch.Tensor] = None,
+        rrmc_boundary_token_offsets_by_chunk: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -113,6 +119,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state_indices=initial_state_indices,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            rrmc_boundary_state_indices_by_chunk=rrmc_boundary_state_indices_by_chunk,
+            rrmc_boundary_token_offsets_by_chunk=rrmc_boundary_token_offsets_by_chunk,
         )
         return o.to(q.dtype), h
 
@@ -130,6 +138,8 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    rrmc_boundary_state_indices_by_chunk: Optional[torch.Tensor] = None,
+    rrmc_boundary_token_offsets_by_chunk: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -244,6 +254,8 @@ def chunk_gated_delta_rule(
         initial_state_indices,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        rrmc_boundary_state_indices_by_chunk,
+        rrmc_boundary_token_offsets_by_chunk,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

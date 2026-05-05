@@ -133,6 +133,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        rrmc_boundary_state_indices_by_chunk: torch.Tensor = None,
+        rrmc_boundary_token_offsets_by_chunk: torch.Tensor = None,
         **kwargs,
     ) -> tuple:
         recurrent_state = ssm_states
@@ -150,6 +152,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
             cu_seqlens=query_start_loc,
             head_first=False,
             use_qk_l2norm_in_kernel=True,
+            rrmc_boundary_state_indices_by_chunk=rrmc_boundary_state_indices_by_chunk,
+            rrmc_boundary_token_offsets_by_chunk=rrmc_boundary_token_offsets_by_chunk,
             **recurrent_state_indices_args,
         )
 

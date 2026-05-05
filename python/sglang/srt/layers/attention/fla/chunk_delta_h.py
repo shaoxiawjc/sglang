@@ -40,6 +40,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h,
     initial_state,
     initial_state_indices,
+    rrmc_boundary_state_indices_by_chunk,
+    rrmc_boundary_token_offsets_by_chunk,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -54,6 +56,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_INITIAL_STATE: tl.constexpr,
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
+    CAPTURE_RRMC_BOUNDARY_STATES: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -175,6 +178,153 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             )
             tl.store(p_v, b_v.to(p_v.dtype.element_ty), boundary_check=(0, 1))
 
+        if CAPTURE_RRMC_BOUNDARY_STATES:
+            boundary_chunk = boh + i_t
+            boundary_state_idx = tl.load(
+                rrmc_boundary_state_indices_by_chunk + boundary_chunk
+            ).to(tl.int32)
+            if boundary_state_idx >= 0:
+                boundary_token_offset = tl.load(
+                    rrmc_boundary_token_offsets_by_chunk + boundary_chunk
+                ).to(tl.int32)
+                boundary_last_idx = boundary_token_offset - 1
+                o_t = tl.arange(0, BT)
+
+                if USE_G:
+                    b_g_boundary_last = tl.load(
+                        g + bos * H + boundary_last_idx * H + i_h
+                    )
+                    p_g_boundary = tl.make_block_ptr(
+                        g + bos * H + i_h,
+                        (T,),
+                        (H,),
+                        (i_t * BT,),
+                        (BT,),
+                        (0,),
+                    )
+                    b_g_boundary = tl.load(p_g_boundary, boundary_check=(0,))
+                    b_v_boundary = b_v * safe_exp(
+                        b_g_boundary_last - b_g_boundary
+                    )[:, None]
+                    b_g_boundary_last = exp(b_g_boundary_last)
+                    b_boundary_h1 = b_h1 * b_g_boundary_last
+                    if K > 64:
+                        b_boundary_h2 = b_h2 * b_g_boundary_last
+                    if K > 128:
+                        b_boundary_h3 = b_h3 * b_g_boundary_last
+                    if K > 192:
+                        b_boundary_h4 = b_h4 * b_g_boundary_last
+                else:
+                    b_v_boundary = b_v
+                    b_boundary_h1 = b_h1 + 0.0
+                    if K > 64:
+                        b_boundary_h2 = b_h2 + 0.0
+                    if K > 128:
+                        b_boundary_h3 = b_h3 + 0.0
+                    if K > 192:
+                        b_boundary_h4 = b_h4 + 0.0
+
+                b_v_boundary = tl.where(
+                    o_t[:, None] < boundary_token_offset, b_v_boundary, 0.0
+                ).to(k.dtype.element_ty)
+
+                p_k = tl.make_block_ptr(
+                    k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+                )
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                b_boundary_h1 += tl.trans(tl.dot(b_k, b_v_boundary))
+                if K > 64:
+                    p_k = tl.make_block_ptr(
+                        k,
+                        (K, T),
+                        (1, stride_k),
+                        (64, i_t * BT),
+                        (64, BT),
+                        (0, 1),
+                    )
+                    b_k = tl.load(p_k, boundary_check=(0, 1))
+                    b_boundary_h2 += tl.trans(tl.dot(b_k, b_v_boundary))
+                if K > 128:
+                    p_k = tl.make_block_ptr(
+                        k,
+                        (K, T),
+                        (1, stride_k),
+                        (128, i_t * BT),
+                        (64, BT),
+                        (0, 1),
+                    )
+                    b_k = tl.load(p_k, boundary_check=(0, 1))
+                    b_boundary_h3 += tl.trans(tl.dot(b_k, b_v_boundary))
+                if K > 192:
+                    p_k = tl.make_block_ptr(
+                        k,
+                        (K, T),
+                        (1, stride_k),
+                        (192, i_t * BT),
+                        (64, BT),
+                        (0, 1),
+                    )
+                    b_k = tl.load(p_k, boundary_check=(0, 1))
+                    b_boundary_h4 += tl.trans(tl.dot(b_k, b_v_boundary))
+
+                boundary_state = initial_state + boundary_state_idx * stride_h
+                boundary_state = boundary_state + i_h * V * K
+                p_boundary_h = tl.make_block_ptr(
+                    boundary_state,
+                    (V, K),
+                    (K, 1),
+                    (i_v * BV, 0),
+                    (BV, 64),
+                    (1, 0),
+                )
+                tl.store(
+                    p_boundary_h,
+                    b_boundary_h1.to(p_boundary_h.dtype.element_ty),
+                    boundary_check=(0, 1),
+                )
+                if K > 64:
+                    p_boundary_h = tl.make_block_ptr(
+                        boundary_state,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 64),
+                        (BV, 64),
+                        (1, 0),
+                    )
+                    tl.store(
+                        p_boundary_h,
+                        b_boundary_h2.to(p_boundary_h.dtype.element_ty),
+                        boundary_check=(0, 1),
+                    )
+                if K > 128:
+                    p_boundary_h = tl.make_block_ptr(
+                        boundary_state,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 128),
+                        (BV, 64),
+                        (1, 0),
+                    )
+                    tl.store(
+                        p_boundary_h,
+                        b_boundary_h3.to(p_boundary_h.dtype.element_ty),
+                        boundary_check=(0, 1),
+                    )
+                if K > 192:
+                    p_boundary_h = tl.make_block_ptr(
+                        boundary_state,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 192),
+                        (BV, 64),
+                        (1, 0),
+                    )
+                    tl.store(
+                        p_boundary_h,
+                        b_boundary_h4.to(p_boundary_h.dtype.element_ty),
+                        boundary_check=(0, 1),
+                    )
+
         last_idx = min((i_t + 1) * BT, T) - 1
         if USE_G:
             b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
@@ -279,6 +429,8 @@ def chunk_gated_delta_rule_fwd_h(
     gk: Optional[torch.Tensor] = None,
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
+    rrmc_boundary_state_indices_by_chunk: Optional[torch.Tensor] = None,
+    rrmc_boundary_token_offsets_by_chunk: Optional[torch.Tensor] = None,
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -319,6 +471,8 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        rrmc_boundary_state_indices_by_chunk=rrmc_boundary_state_indices_by_chunk,
+        rrmc_boundary_token_offsets_by_chunk=rrmc_boundary_token_offsets_by_chunk,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
@@ -333,6 +487,9 @@ def chunk_gated_delta_rule_fwd_h(
         USE_INITIAL_STATE=initial_state is not None,
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
+        CAPTURE_RRMC_BOUNDARY_STATES=(
+            rrmc_boundary_state_indices_by_chunk is not None
+        ),
         IS_VARLEN=cu_seqlens is not None,
         num_warps=4,
         num_stages=2,
