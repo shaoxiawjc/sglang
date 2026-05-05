@@ -500,9 +500,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
     ) -> torch.Tensor:
         seq_len = mixed_qkv.shape[0]
-        core_attn_out = mixed_qkv.new_zeros(
+        core_attn_out = mixed_qkv.new_empty(
             1, seq_len, layer.num_v_heads, layer.head_v_dim
         )
+        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
         boundaries_by_req: dict[int, list[tuple[int, int, int]]] = {}
         for req_idx, local_start, local_end, mamba_idx in zip(
@@ -531,8 +532,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self._run_rrmc_prefill_segment(
                         layer=layer,
                         mixed_qkv=mixed_qkv,
-                        a=a,
-                        b=b,
+                        g=g,
+                        beta=beta,
                         conv_states=conv_states,
                         ssm_states=ssm_states,
                         cache_indices=cache_indices,
@@ -549,8 +550,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self._run_rrmc_prefill_segment(
                         layer=layer,
                         mixed_qkv=mixed_qkv,
-                        a=a,
-                        b=b,
+                        g=g,
+                        beta=beta,
                         conv_states=conv_states,
                         ssm_states=ssm_states,
                         cache_indices=cache_indices,
@@ -574,8 +575,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self._run_rrmc_prefill_segment(
                     layer=layer,
                     mixed_qkv=mixed_qkv,
-                    a=a,
-                    b=b,
+                    g=g,
+                    beta=beta,
                     conv_states=conv_states,
                     ssm_states=ssm_states,
                     cache_indices=cache_indices,
@@ -588,6 +589,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
             req_start = req_end
 
+        assert req_start == seq_len
         return core_attn_out
 
     def _run_rrmc_prefill_segment(
@@ -595,8 +597,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         *,
         layer: RadixLinearAttention,
         mixed_qkv: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
@@ -644,18 +646,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, segment_len, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, segment_len, layer.num_v_heads, layer.head_v_dim)
 
-        g, beta = fused_gdn_gating(
-            layer.A_log,
-            a[segment_start:segment_end],
-            b[segment_start:segment_end],
-            layer.dt_bias,
-        )
         segment_out, last_recurrent_state, _ = self.kernel_dispatcher.extend(
             q=query,
             k=key,
             v=value,
-            g=g,
-            beta=beta,
+            g=g[:, segment_start:segment_end],
+            beta=beta[:, segment_start:segment_end],
             ssm_states=ssm_states,
             cache_indices=segment_cache_indices,
             query_start_loc=segment_query_start_loc,
