@@ -793,10 +793,10 @@ class RRMCMambaRadixCache(MambaRadixCache):
         if not pending:
             return None
 
-        slots = self.req_to_token_pool.mamba_pool.alloc(len(pending))
+        slots = self.req_to_token_pool.mamba_pool.alloc_uninitialized(len(pending))
         if slots is None:
             self.evict(EvictParams(num_tokens=0, mamba_num=len(pending)))
-            slots = self.req_to_token_pool.mamba_pool.alloc(len(pending))
+            slots = self.req_to_token_pool.mamba_pool.alloc_uninitialized(len(pending))
 
         if slots is None:
             self.total_rrmc_boundary_state_capture_failures += len(pending)
