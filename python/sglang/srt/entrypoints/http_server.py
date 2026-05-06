@@ -666,6 +666,8 @@ def _aggregate_cache_metrics(
         "total_evicted_blocks",
         "total_rrmc_forced_chunks",
         "total_rrmc_created_states",
+        "total_rrmc_boundary_states_created",
+        "total_rrmc_boundary_state_capture_failures",
         "total_rrmc_accepted_state_hits",
         "total_rrmc_skipped_cold_boundaries",
     )
