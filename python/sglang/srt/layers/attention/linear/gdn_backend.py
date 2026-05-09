@@ -50,7 +50,11 @@ elif is_cpu():
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
-_ENABLE_RRMC_FUSED_BOUNDARY = get_bool_env_var("SGLANG_RRMC_FUSED_BOUNDARY")
+# RRMC fused boundary is the default path. Set SGLANG_RRMC_FUSED_BOUNDARY=0
+# (or false) to fall back to the segmented boundary implementation.
+_ENABLE_RRMC_FUSED_BOUNDARY = get_bool_env_var(
+    "SGLANG_RRMC_FUSED_BOUNDARY", default="true"
+)
 
 
 class GDNKernelDispatcher:
