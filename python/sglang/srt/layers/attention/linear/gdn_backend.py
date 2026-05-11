@@ -651,12 +651,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ):
             return None
 
-        fused_metadata = self._build_rrmc_fused_boundary_metadata(
-            forward_batch=forward_batch,
-            mixed_qkv=mixed_qkv,
-            conv_states=conv_states,
-            boundaries_by_req=boundaries_by_req,
+        metadata_cache = getattr(
+            forward_batch, "_rrmc_fused_boundary_metadata_cache", None
         )
+        if metadata_cache is None:
+            metadata_cache = {}
+            setattr(
+                forward_batch,
+                "_rrmc_fused_boundary_metadata_cache",
+                metadata_cache,
+            )
+        metadata_key = (str(mixed_qkv.device), int(conv_states.shape[-1]))
+        if metadata_key not in metadata_cache:
+            metadata_cache[metadata_key] = self._build_rrmc_fused_boundary_metadata(
+                forward_batch=forward_batch,
+                mixed_qkv=mixed_qkv,
+                conv_states=conv_states,
+                boundaries_by_req=boundaries_by_req,
+            )
+        fused_metadata = metadata_cache[metadata_key]
         if fused_metadata is None:
             return None
 

@@ -144,6 +144,13 @@ class RRMCMambaRadixCache(MambaRadixCache):
             (cached_tokens, non_cached_tokens): cost
             for cached_tokens, non_cached_tokens, cost in self.rrmc_pgdsf_cost_profile
         }
+        self.enable_rrmc_admission = bool(
+            getattr(server_args, "enable_rrmc_admission", False)
+        )
+        self.rrmc_admission_min_accesses = max(
+            1, int(getattr(server_args, "rrmc_admission_min_accesses", 2))
+        )
+        self.rrmc_admission_counts: dict[tuple[str, str, str, int], int] = {}
         configured_segment_size = getattr(server_args, "rrmc_segment_size", None)
         if configured_segment_size is None:
             configured_segment_size = (
@@ -155,13 +162,20 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self._warned_page_size = False
         self._warned_bad_metadata = False
         logger.info(
-            "Initialized RRMCMambaRadixCache with eviction policy: %s, segment_size=%s, marconi_alpha=%s, pgdsf_profile_points=%s",
+            "Initialized RRMCMambaRadixCache with eviction policy: %s, segment_size=%s, marconi_alpha=%s, pgdsf_profile_points=%s, admission=%s, admission_min_accesses=%s",
             self.rrmc_eviction_policy,
             self.rrmc_segment_size,
             self.rrmc_marconi_alpha,
             len(self.rrmc_pgdsf_cost_profile),
+            self.enable_rrmc_admission,
+            self.rrmc_admission_min_accesses,
         )
         # self.disable = True
+
+    def reset(self) -> None:
+        super().reset()
+        if hasattr(self, "rrmc_admission_counts"):
+            self.rrmc_admission_counts.clear()
 
     def _reset_cache_perf_counters(self) -> None:
         super()._reset_cache_perf_counters()
@@ -733,6 +747,46 @@ class RRMCMambaRadixCache(MambaRadixCache):
     def rrmc_disable_operator_chunk_state_tracking(self, req: Req) -> bool:
         return self._get_cacheable_blocks(req) is not None
 
+    def _lookup_block_end_node(self, req: Req, block_end: int) -> Optional[TreeNode]:
+        segment_specs = self._get_req_segments(req)
+        if not segment_specs:
+            return None
+
+        node = self.root_node
+        extra_key = req.extra_key
+        for segment in segment_specs:
+            if segment.end > block_end:
+                return None
+            tree_key = self._make_tree_key(node, extra_key, segment)
+            child = node.children.get(tree_key)
+            if child is None:
+                return None
+            node = child
+            if segment.end == block_end:
+                return node
+        return None
+
+    def _has_cached_mamba_for_block_end(self, req: Req, block_end: int) -> bool:
+        node = self._lookup_block_end_node(req, block_end)
+        return node is not None and node.mamba_value is not None
+
+    def _admit_rrmc_boundary_capture(self, block: RRMCBlockSpec) -> bool:
+        if not self.enable_rrmc_admission:
+            return True
+        if self.rrmc_admission_min_accesses <= 1:
+            return True
+
+        access_count = self.rrmc_admission_counts.get(block.identity, 0) + 1
+        self.rrmc_admission_counts[block.identity] = access_count
+        if access_count < self.rrmc_admission_min_accesses:
+            self.total_rrmc_skipped_cold_boundaries += 1
+            return False
+        return True
+
+    def _was_rrmc_boundary_admission_skipped(self, req: Req, block_end: int) -> bool:
+        skipped = getattr(req, "_rrmc_admission_skipped_block_ends", None)
+        return isinstance(skipped, set) and int(block_end) in skipped
+
     def prepare_rrmc_forward_boundaries(
         self,
         reqs: list[Req],
@@ -750,6 +804,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
             self._release_unattached_rrmc_boundary_slots(req)
             setattr(req, "_rrmc_boundary_mamba_indices_by_end", {})
             setattr(req, "_rrmc_pending_boundary_mamba_indices", {})
+            setattr(req, "_rrmc_admission_skipped_block_ends", set())
 
         if self.disable or self.page_size != 1:
             return None
@@ -773,6 +828,13 @@ class RRMCMambaRadixCache(MambaRadixCache):
                     continue
                 if block.end > extend_end:
                     break
+                if self._has_cached_mamba_for_block_end(req, int(block.end)):
+                    continue
+                if not self._admit_rrmc_boundary_capture(block):
+                    getattr(req, "_rrmc_admission_skipped_block_ends").add(
+                        int(block.end)
+                    )
+                    continue
 
                 local_end = flat_offset + (block.end - prefix_len)
                 if local_end <= segment_local_start:
@@ -1126,6 +1188,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 )
 
             if segment.is_block_end:
+                if self._was_rrmc_boundary_admission_skipped(req, segment.end):
+                    continue
                 boundary_slot = self._consume_rrmc_boundary_slot(req, segment.end)
                 self._ensure_mamba_on_node(req, child, boundary_slot)
                 if child.mamba_value is not None:

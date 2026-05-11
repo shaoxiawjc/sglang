@@ -368,6 +368,8 @@ class ServerArgs:
     rrmc_radix_eviction_policy: str = "value_aware"
     rrmc_marconi_alpha: float = 1.0
     rrmc_pgdsf_cost_profile_path: Optional[str] = None
+    enable_rrmc_admission: bool = False
+    rrmc_admission_min_accesses: int = 2
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -4047,6 +4049,23 @@ class ServerArgs:
                 "Optional JSON profile for RRMC PGDSF cost lookup. The file may "
                 "contain a list or a {'points': [...]} object with cached_tokens, "
                 "non_cached_tokens, and cost/cost_ms/latency_ms fields."
+            ),
+        )
+        parser.add_argument(
+            "--enable-rrmc-admission",
+            action="store_true",
+            help=(
+                "Enable RRMC boundary-state admission. When enabled, cold blocks "
+                "are observed before allocating reusable Mamba state slots."
+            ),
+        )
+        parser.add_argument(
+            "--rrmc-admission-min-accesses",
+            type=int,
+            default=ServerArgs.rrmc_admission_min_accesses,
+            help=(
+                "Minimum observed accesses before RRMC captures a block boundary "
+                "Mamba state when --enable-rrmc-admission is set."
             ),
         )
         parser.add_argument(
