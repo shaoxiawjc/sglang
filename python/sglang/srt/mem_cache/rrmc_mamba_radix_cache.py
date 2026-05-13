@@ -165,7 +165,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self.rrmc_admission_min_accesses = max(
             1, int(getattr(server_args, "rrmc_admission_min_accesses", 2))
         )
-        self.rrmc_admission_counts: dict[tuple[str, str, str, int], int] = {}
+        self.rrmc_admission_counts: dict[tuple[Any, ...], int] = {}
         configured_segment_size = getattr(server_args, "rrmc_segment_size", None)
         if configured_segment_size is None:
             configured_segment_size = (
@@ -803,14 +803,21 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 cached_by_end[int(segment.end)] = node.mamba_value is not None
         return cached_by_end
 
-    def _admit_rrmc_boundary_capture(self, block: RRMCBlockSpec) -> bool:
+    def _rrmc_admission_key(
+        self,
+        req: Req,
+        block_path: list[tuple[str, str, str, int]],
+    ) -> tuple[Any, ...]:
+        return ("rrmc_path", req.extra_key or "", tuple(block_path))
+
+    def _admit_rrmc_boundary_capture(self, admission_key: tuple[Any, ...]) -> bool:
         if not self.enable_rrmc_admission:
             return True
         if self.rrmc_admission_min_accesses <= 1:
             return True
 
-        access_count = self.rrmc_admission_counts.get(block.identity, 0) + 1
-        self.rrmc_admission_counts[block.identity] = access_count
+        access_count = self.rrmc_admission_counts.get(admission_key, 0) + 1
+        self.rrmc_admission_counts[admission_key] = access_count
         if access_count < self.rrmc_admission_min_accesses:
             self.total_rrmc_skipped_cold_boundaries += 1
             return False
@@ -857,14 +864,17 @@ class RRMCMambaRadixCache(MambaRadixCache):
             extend_len = int(extend_len)
             extend_end = prefix_len + extend_len
             segment_local_start = flat_offset
+            admission_block_path: list[tuple[str, str, str, int]] = []
             for block in block_specs:
+                admission_block_path.append(block.identity)
                 if block.end <= prefix_len:
                     continue
                 if block.end > extend_end:
                     break
                 if cached_mamba_by_end.get(int(block.end), False):
                     continue
-                if not self._admit_rrmc_boundary_capture(block):
+                admission_key = self._rrmc_admission_key(req, admission_block_path)
+                if not self._admit_rrmc_boundary_capture(admission_key):
                     getattr(req, "_rrmc_admission_skipped_block_ends").add(
                         int(block.end)
                     )
