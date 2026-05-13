@@ -165,7 +165,9 @@ class SchedulerRuntimeCheckerMixin:
             cached_mamba_pages = set(
                 self.tree_cache.all_mamba_values_flatten().tolist()
             )
-            expected_mamba_pages = set(range(self.req_to_token_pool.mamba_pool.size))
+            expected_mamba_pages = set(
+                range(1, self.req_to_token_pool.mamba_pool.size + 1)
+            )
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )

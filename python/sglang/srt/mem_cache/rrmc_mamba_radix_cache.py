@@ -1183,10 +1183,17 @@ class RRMCMambaRadixCache(MambaRadixCache):
     ) -> tuple[int, TreeNode]:
         del chunked  # RRMC counts explicit matches, not token-level chunk hits.
 
+        cache_until = self._rrmc_cache_prefix_limit(req, segment_specs)
+        if cache_until <= 0:
+            return req.cache_protected_len, self.root_node
+
         node = self.root_node
         extra_key = req.extra_key
         duplicate_ranges: list[tuple[int, int]] = []
         for segment in segment_specs:
+            if segment.end > cache_until:
+                break
+
             tree_key = self._make_tree_key(node, extra_key, segment)
             child = node.children.get(tree_key)
             if child is None:
@@ -1252,6 +1259,47 @@ class RRMCMambaRadixCache(MambaRadixCache):
             free_start = max(start, duplicate_free_from)
             if free_start < end:
                 self.token_to_kv_pool_allocator.free(kv_indices[free_start:end])
+
+    def _rrmc_cache_prefix_limit(
+        self, req: Req, segment_specs: list[RRMCSegmentSpec]
+    ) -> int:
+        """Return the largest prefix end that will have a reusable Mamba state.
+
+        Full-attention KV before a skipped RRMC boundary is only useful when a
+        later boundary in the same prefix is cached. If admission skips every
+        boundary, keeping KV-only tree nodes would leave the allocator and tree
+        accounting inconsistent after the request-owned KV is freed.
+        """
+        limit = 0
+
+        pending_by_end = getattr(req, "_rrmc_boundary_mamba_indices_by_end", None)
+        skipped_by_end = getattr(req, "_rrmc_admission_skipped_block_ends", None)
+        if not isinstance(pending_by_end, dict):
+            pending_by_end = {}
+        if not isinstance(skipped_by_end, set):
+            skipped_by_end = set()
+
+        for segment in segment_specs:
+            if not segment.is_block_end:
+                continue
+            block_end = int(segment.end)
+            if block_end in skipped_by_end:
+                continue
+            if block_end in pending_by_end:
+                limit = block_end
+
+        node = self.root_node
+        extra_key = req.extra_key
+        for segment in segment_specs:
+            tree_key = self._make_tree_key(node, extra_key, segment)
+            child = node.children.get(tree_key)
+            if child is None:
+                break
+            node = child
+            if segment.is_block_end and child.mamba_value is not None:
+                limit = max(limit, int(segment.end))
+
+        return limit
 
     def _collect_prefix_indices(self, last_node: TreeNode) -> torch.Tensor:
         values: list[torch.Tensor] = []
