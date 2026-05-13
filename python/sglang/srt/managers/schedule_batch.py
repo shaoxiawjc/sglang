@@ -1302,6 +1302,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     rrmc_boundary_local_starts_cpu: Optional[List[int]] = None
     rrmc_boundary_local_ends_cpu: Optional[List[int]] = None
     rrmc_boundary_mamba_indices_cpu: Optional[List[int]] = None
+    rrmc_boundaries_by_req: Optional[Dict[int, List[Tuple[int, int, int]]]] = None
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -1592,6 +1593,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.rrmc_boundary_local_starts_cpu = None
         self.rrmc_boundary_local_ends_cpu = None
         self.rrmc_boundary_mamba_indices_cpu = None
+        self.rrmc_boundaries_by_req = None
 
         prepare_rrmc_boundaries = getattr(
             self.tree_cache, "prepare_rrmc_forward_boundaries", None
@@ -1605,6 +1607,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.rrmc_boundary_local_starts_cpu = rrmc_boundaries.local_starts
                 self.rrmc_boundary_local_ends_cpu = rrmc_boundaries.local_ends
                 self.rrmc_boundary_mamba_indices_cpu = rrmc_boundaries.mamba_indices
+                self.rrmc_boundaries_by_req = rrmc_boundaries.boundaries_by_req
                 self.rrmc_boundary_req_indices = torch.tensor(
                     self.rrmc_boundary_req_indices_cpu,
                     dtype=torch.int64,
@@ -2452,6 +2455,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             rrmc_boundary_local_starts_cpu=self.rrmc_boundary_local_starts_cpu,
             rrmc_boundary_local_ends_cpu=self.rrmc_boundary_local_ends_cpu,
             rrmc_boundary_mamba_indices_cpu=self.rrmc_boundary_mamba_indices_cpu,
+            rrmc_boundaries_by_req=self.rrmc_boundaries_by_req,
         )
 
     def copy(self):
@@ -2659,3 +2663,4 @@ class ModelWorkerBatch:
     rrmc_boundary_local_starts_cpu: Optional[List[int]] = None
     rrmc_boundary_local_ends_cpu: Optional[List[int]] = None
     rrmc_boundary_mamba_indices_cpu: Optional[List[int]] = None
+    rrmc_boundaries_by_req: Optional[Dict[int, List[Tuple[int, int, int]]]] = None

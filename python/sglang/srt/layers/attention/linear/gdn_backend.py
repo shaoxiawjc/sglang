@@ -509,18 +509,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         seq_len = mixed_qkv.shape[0]
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
-        boundaries_by_req: dict[int, list[tuple[int, int, int]]] = {}
-        for req_idx, local_start, local_end, mamba_idx in zip(
-            forward_batch.rrmc_boundary_req_indices_cpu,
-            forward_batch.rrmc_boundary_local_starts_cpu,
-            forward_batch.rrmc_boundary_local_ends_cpu,
-            forward_batch.rrmc_boundary_mamba_indices_cpu,
-        ):
-            boundaries_by_req.setdefault(int(req_idx), []).append(
-                (int(local_start), int(local_end), int(mamba_idx))
-            )
-        for req_boundaries in boundaries_by_req.values():
-            req_boundaries.sort(key=lambda item: (item[0], item[1]))
+        boundaries_by_req = self._get_rrmc_boundaries_by_req(forward_batch)
 
         fused_out = self._try_forward_extend_rrmc_fused_boundaries(
             layer=layer,
@@ -540,7 +529,88 @@ class GDNAttnBackend(MambaAttnBackendBase):
             1, seq_len, layer.num_v_heads, layer.head_v_dim
         )
 
-        segments_by_req: list[list[tuple[int, int, int, bool, int]]] = []
+        segments_by_req = self._get_rrmc_segments_by_req(
+            forward_batch, boundaries_by_req
+        )
+        req_start = sum(
+            int(req_extend_len)
+            for req_extend_len in forward_batch.extend_seq_lens_cpu
+        )
+        assert req_start == seq_len
+
+        max_num_segments = max(
+            (len(req_segments) for req_segments in segments_by_req), default=0
+        )
+        for segment_idx in range(max_num_segments):
+            segment_batch = [
+                req_segments[segment_idx]
+                for req_segments in segments_by_req
+                if segment_idx < len(req_segments)
+            ]
+            self._run_rrmc_prefill_segment_batch(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                g=g,
+                beta=beta,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                segments=segment_batch,
+                core_attn_out=core_attn_out,
+            )
+
+            capture_req_indices = []
+            capture_mamba_indices = []
+            for req_idx, _, _, _, boundary_mamba_idx in segment_batch:
+                if boundary_mamba_idx >= 0:
+                    capture_req_indices.append(req_idx)
+                    capture_mamba_indices.append(boundary_mamba_idx)
+            self._capture_rrmc_boundary_states(
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                req_indices=capture_req_indices,
+                boundary_mamba_indices=capture_mamba_indices,
+            )
+
+        return core_attn_out
+
+    def _get_rrmc_boundaries_by_req(
+        self,
+        forward_batch: ForwardBatch,
+    ) -> dict[int, list[tuple[int, int, int]]]:
+        boundaries_by_req = getattr(forward_batch, "rrmc_boundaries_by_req", None)
+        if boundaries_by_req is not None:
+            return boundaries_by_req
+
+        if not forward_batch.rrmc_boundary_req_indices_cpu:
+            return {}
+
+        boundaries_by_req = {}
+        for req_idx, local_start, local_end, mamba_idx in zip(
+            forward_batch.rrmc_boundary_req_indices_cpu,
+            forward_batch.rrmc_boundary_local_starts_cpu,
+            forward_batch.rrmc_boundary_local_ends_cpu,
+            forward_batch.rrmc_boundary_mamba_indices_cpu,
+        ):
+            boundaries_by_req.setdefault(int(req_idx), []).append(
+                (int(local_start), int(local_end), int(mamba_idx))
+            )
+        for req_boundaries in boundaries_by_req.values():
+            req_boundaries.sort(key=lambda item: (item[0], item[1]))
+        setattr(forward_batch, "rrmc_boundaries_by_req", boundaries_by_req)
+        return boundaries_by_req
+
+    def _get_rrmc_segments_by_req(
+        self,
+        forward_batch: ForwardBatch,
+        boundaries_by_req: dict[int, list[tuple[int, int, int]]],
+    ) -> list[list[tuple[int, int, int, bool, int]]]:
+        segments_by_req = getattr(forward_batch, "rrmc_segments_by_req", None)
+        if segments_by_req is not None:
+            return segments_by_req
+
+        segments_by_req = []
         req_start = 0
         for req_idx, req_extend_len in enumerate(forward_batch.extend_seq_lens_cpu):
             req_end = req_start + int(req_extend_len)
@@ -592,44 +662,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             segments_by_req.append(req_segments)
             req_start = req_end
 
-        assert req_start == seq_len
-
-        max_num_segments = max(
-            (len(req_segments) for req_segments in segments_by_req), default=0
-        )
-        for segment_idx in range(max_num_segments):
-            segment_batch = [
-                req_segments[segment_idx]
-                for req_segments in segments_by_req
-                if segment_idx < len(req_segments)
-            ]
-            self._run_rrmc_prefill_segment_batch(
-                layer=layer,
-                mixed_qkv=mixed_qkv,
-                g=g,
-                beta=beta,
-                conv_states=conv_states,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                segments=segment_batch,
-                core_attn_out=core_attn_out,
-            )
-
-            capture_req_indices = []
-            capture_mamba_indices = []
-            for req_idx, _, _, _, boundary_mamba_idx in segment_batch:
-                if boundary_mamba_idx >= 0:
-                    capture_req_indices.append(req_idx)
-                    capture_mamba_indices.append(boundary_mamba_idx)
-            self._capture_rrmc_boundary_states(
-                conv_states=conv_states,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                req_indices=capture_req_indices,
-                boundary_mamba_indices=capture_mamba_indices,
-            )
-
-        return core_attn_out
+        setattr(forward_batch, "rrmc_segments_by_req", segments_by_req)
+        return segments_by_req
 
     def _try_forward_extend_rrmc_fused_boundaries(
         self,

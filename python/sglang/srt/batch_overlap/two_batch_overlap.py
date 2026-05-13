@@ -744,6 +744,22 @@ class TboForwardBatchPreparer:
         output_dict["rrmc_boundary_mamba_indices_cpu"] = (
             rrmc_boundary_mamba_indices_cpu if rrmc_enabled else None
         )
+        if rrmc_enabled:
+            rrmc_boundaries_by_req = {}
+            for req_idx, local_start, local_end, mamba_idx in zip(
+                rrmc_boundary_req_indices_cpu,
+                rrmc_boundary_local_starts_cpu,
+                rrmc_boundary_local_ends_cpu,
+                rrmc_boundary_mamba_indices_cpu,
+            ):
+                rrmc_boundaries_by_req.setdefault(int(req_idx), []).append(
+                    (int(local_start), int(local_end), int(mamba_idx))
+                )
+            for req_boundaries in rrmc_boundaries_by_req.values():
+                req_boundaries.sort(key=lambda item: (item[0], item[1]))
+        else:
+            rrmc_boundaries_by_req = None
+        output_dict["rrmc_boundaries_by_req"] = rrmc_boundaries_by_req
         output_dict["rrmc_boundary_req_indices"] = (
             torch.tensor(
                 rrmc_boundary_req_indices_cpu,

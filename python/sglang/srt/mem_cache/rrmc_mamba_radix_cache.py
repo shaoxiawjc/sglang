@@ -89,6 +89,21 @@ class RRMCForwardBoundaryBatch:
     boundaries: list[RRMCForwardBoundary]
 
     @property
+    def boundaries_by_req(self) -> dict[int, list[tuple[int, int, int]]]:
+        by_req: dict[int, list[tuple[int, int, int]]] = {}
+        for boundary in self.boundaries:
+            by_req.setdefault(int(boundary.req_index), []).append(
+                (
+                    int(boundary.local_start),
+                    int(boundary.local_end),
+                    int(boundary.mamba_index),
+                )
+            )
+        for req_boundaries in by_req.values():
+            req_boundaries.sort(key=lambda item: (item[0], item[1]))
+        return by_req
+
+    @property
     def req_indices(self) -> list[int]:
         return [boundary.req_index for boundary in self.boundaries]
 
@@ -770,6 +785,24 @@ class RRMCMambaRadixCache(MambaRadixCache):
         node = self._lookup_block_end_node(req, block_end)
         return node is not None and node.mamba_value is not None
 
+    def _cached_mamba_by_block_end(self, req: Req) -> dict[int, bool]:
+        segment_specs = self._get_req_segments(req)
+        if not segment_specs:
+            return {}
+
+        node = self.root_node
+        extra_key = req.extra_key
+        cached_by_end: dict[int, bool] = {}
+        for segment in segment_specs:
+            tree_key = self._make_tree_key(node, extra_key, segment)
+            child = node.children.get(tree_key)
+            if child is None:
+                break
+            node = child
+            if segment.is_block_end:
+                cached_by_end[int(segment.end)] = node.mamba_value is not None
+        return cached_by_end
+
     def _admit_rrmc_boundary_capture(self, block: RRMCBlockSpec) -> bool:
         if not self.enable_rrmc_admission:
             return True
@@ -819,6 +852,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 flat_offset += int(extend_len)
                 continue
 
+            cached_mamba_by_end = self._cached_mamba_by_block_end(req)
             prefix_len = int(prefix_len)
             extend_len = int(extend_len)
             extend_end = prefix_len + extend_len
@@ -828,7 +862,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
                     continue
                 if block.end > extend_end:
                     break
-                if self._has_cached_mamba_for_block_end(req, int(block.end)):
+                if cached_mamba_by_end.get(int(block.end), False):
                     continue
                 if not self._admit_rrmc_boundary_capture(block):
                     getattr(req, "_rrmc_admission_skipped_block_ends").add(
@@ -864,6 +898,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
             self.total_rrmc_boundary_state_capture_failures += len(pending)
             return None
 
+        slot_ids = [int(slot_id) for slot_id in slots.detach().cpu().tolist()]
         boundaries: list[RRMCForwardBoundary] = []
         for slot_offset, (
             req,
@@ -873,11 +908,11 @@ class RRMCMambaRadixCache(MambaRadixCache):
             local_end,
         ) in enumerate(pending):
             slot = slots[slot_offset : slot_offset + 1]
-            slot_id = int(slot[0].item())
+            slot_id = slot_ids[slot_offset]
             boundary_map = getattr(req, "_rrmc_boundary_mamba_indices_by_end")
             pending_map = getattr(req, "_rrmc_pending_boundary_mamba_indices")
             boundary_map[block_end] = slot
-            pending_map[slot_id] = slot
+            pending_map[block_end] = slot
             boundaries.append(
                 RRMCForwardBoundary(
                     req_index=req_index,
@@ -905,11 +940,11 @@ class RRMCMambaRadixCache(MambaRadixCache):
             return None
         return boundary_map.get(int(block_end))
 
-    def _mark_rrmc_boundary_slot_attached(self, req: Req, slot: torch.Tensor) -> None:
+    def _mark_rrmc_boundary_slot_attached(self, req: Req, block_end: int) -> None:
         pending_map = getattr(req, "_rrmc_pending_boundary_mamba_indices", None)
         if not pending_map:
             return
-        pending_map.pop(int(slot[0].item()), None)
+        pending_map.pop(int(block_end), None)
 
     def _get_req_blocks(self, req: Req) -> Optional[list[RRMCBlockSpec]]:
         cached = getattr(req, "_rrmc_block_specs_cache", None)
@@ -1083,7 +1118,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         node = TreeNode()
         node.parent = parent
         node.key = RadixKey(token_ids=token_ids, extra_key=extra_key)
-        node.value = kv_values.clone()
+        node.value = kv_values.to(dtype=torch.int64, copy=True)
         node.mamba_value = None
         node.last_access_time = get_last_access_time()
         node.hit_count = 1
@@ -1116,12 +1151,14 @@ class RRMCMambaRadixCache(MambaRadixCache):
             self.total_rrmc_boundary_state_capture_failures += 1
             return False
 
-        node.mamba_value = boundary_slot.to(dtype=torch.int64, copy=True)
+        node.mamba_value = boundary_slot.to(dtype=torch.int64, copy=False)
         node.last_access_time = get_last_access_time()
         self.mamba_lru_list.insert_mru(node)
         self.mamba_evictable_size_ += len(node.mamba_value)
         self._on_checkpoint_created(node)
-        self._mark_rrmc_boundary_slot_attached(req, boundary_slot)
+        self._mark_rrmc_boundary_slot_attached(
+            req, int(getattr(node, "rrmc_prefix_tokens", 0))
+        )
         self.total_rrmc_created_states += 1
         self.total_rrmc_boundary_states_created += 1
         return True
@@ -1158,9 +1195,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
                     tree_key=tree_key,
                     segment=segment,
                     token_ids=token_ids[segment.start : segment.end],
-                    kv_values=kv_indices[segment.start : segment.end].to(
-                        dtype=torch.int64, copy=True
-                    ),
+                    kv_values=kv_indices[segment.start : segment.end],
                     extra_key=extra_key,
                 )
             else:

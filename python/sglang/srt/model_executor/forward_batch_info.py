@@ -320,6 +320,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     rrmc_boundary_local_starts_cpu: Optional[List[int]] = None
     rrmc_boundary_local_ends_cpu: Optional[List[int]] = None
     rrmc_boundary_mamba_indices_cpu: Optional[List[int]] = None
+    rrmc_boundaries_by_req: Optional[Dict[int, List[Tuple[int, int, int]]]] = None
+    rrmc_segments_by_req: Optional[
+        List[List[Tuple[int, int, int, bool, int]]]
+    ] = None
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -472,6 +476,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             rrmc_boundary_local_starts_cpu=batch.rrmc_boundary_local_starts_cpu,
             rrmc_boundary_local_ends_cpu=batch.rrmc_boundary_local_ends_cpu,
             rrmc_boundary_mamba_indices_cpu=batch.rrmc_boundary_mamba_indices_cpu,
+            rrmc_boundaries_by_req=batch.rrmc_boundaries_by_req,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
