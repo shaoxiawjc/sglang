@@ -174,14 +174,7 @@ NSA_CHOICES = [
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
-RRMC_RADIX_EVICTION_POLICY_CHOICES = [
-    "lru",
-    "lfu",
-    "gdsf",
-    "pgdsf",
-    "marconi",
-    "value_aware",
-]
+RRMC_RADIX_EVICTION_POLICY_CHOICES = ["lru"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -365,9 +358,7 @@ class ServerArgs:
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_rrmc_radix_cache: bool = False
-    rrmc_radix_eviction_policy: str = "value_aware"
-    rrmc_marconi_alpha: float = 1.0
-    rrmc_pgdsf_cost_profile_path: Optional[str] = None
+    rrmc_radix_eviction_policy: str = "lru"
     enable_rrmc_admission: bool = False
     rrmc_admission_min_accesses: int = 2
     enable_prefill_delayer: bool = False
@@ -4030,26 +4021,7 @@ class ServerArgs:
             type=str,
             choices=RRMC_RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.rrmc_radix_eviction_policy,
-            help="Eviction policy for the RRMC block-aware radix cache.",
-        )
-        parser.add_argument(
-            "--rrmc-marconi-alpha",
-            type=float,
-            default=ServerArgs.rrmc_marconi_alpha,
-            help=(
-                "Alpha used by the RRMC 'marconi' eviction policy: "
-                "utility = normalized_recency + alpha * normalized_flop_efficiency."
-            ),
-        )
-        parser.add_argument(
-            "--rrmc-pgdsf-cost-profile-path",
-            type=str,
-            default=ServerArgs.rrmc_pgdsf_cost_profile_path,
-            help=(
-                "Optional JSON profile for RRMC PGDSF cost lookup. The file may "
-                "contain a list or a {'points': [...]} object with cached_tokens, "
-                "non_cached_tokens, and cost/cost_ms/latency_ms fields."
-            ),
+            help="Eviction policy for the RRMC block-aware radix cache. Only LRU is supported.",
         )
         parser.add_argument(
             "--enable-rrmc-admission",

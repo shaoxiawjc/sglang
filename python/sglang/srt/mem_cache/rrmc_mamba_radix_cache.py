@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import bisect
 import dataclasses
-import json
 import logging
-import math
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -143,22 +140,6 @@ class RRMCMambaRadixCache(MambaRadixCache):
     def __init__(self, params):
         super().__init__(params)
         server_args = get_global_server_args()
-        self.rrmc_eviction_policy = getattr(
-            server_args, "rrmc_radix_eviction_policy", "value_aware"
-        ).lower()
-        self.rrmc_marconi_alpha = float(
-            getattr(server_args, "rrmc_marconi_alpha", 1.0)
-        )
-        self.rrmc_pgdsf_cost_profile_path = getattr(
-            server_args, "rrmc_pgdsf_cost_profile_path", None
-        )
-        self.rrmc_pgdsf_cost_profile = self._load_pgdsf_cost_profile(
-            self.rrmc_pgdsf_cost_profile_path
-        )
-        self.rrmc_pgdsf_cost_profile_map = {
-            (cached_tokens, non_cached_tokens): cost
-            for cached_tokens, non_cached_tokens, cost in self.rrmc_pgdsf_cost_profile
-        }
         self.enable_rrmc_admission = bool(
             getattr(server_args, "enable_rrmc_admission", False)
         )
@@ -177,11 +158,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self._warned_page_size = False
         self._warned_bad_metadata = False
         logger.info(
-            "Initialized RRMCMambaRadixCache with eviction policy: %s, segment_size=%s, marconi_alpha=%s, pgdsf_profile_points=%s, admission=%s, admission_min_accesses=%s",
-            self.rrmc_eviction_policy,
+            "Initialized RRMCMambaRadixCache with eviction policy: lru, segment_size=%s, admission=%s, admission_min_accesses=%s",
             self.rrmc_segment_size,
-            self.rrmc_marconi_alpha,
-            len(self.rrmc_pgdsf_cost_profile),
             self.enable_rrmc_admission,
             self.rrmc_admission_min_accesses,
         )
@@ -202,275 +180,6 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self.total_rrmc_boundary_state_capture_failures = 0
         self.total_rrmc_accepted_state_hits = 0
         self.total_rrmc_skipped_cold_boundaries = 0
-        self.rrmc_full_gdsf_clock = 0.0
-        self.rrmc_mamba_gdsf_clock = 0.0
-        self.rrmc_full_pgdsf_clock = 0.0
-        self.rrmc_mamba_pgdsf_clock = 0.0
-
-    def _load_pgdsf_cost_profile(
-        self, profile_path: Optional[str]
-    ) -> list[tuple[float, float, float]]:
-        if not profile_path:
-            return []
-        try:
-            with open(profile_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except Exception as exc:
-            logger.warning(
-                "Failed to load RRMC PGDSF cost profile %s: %s", profile_path, exc
-            )
-            return []
-
-        if isinstance(payload, dict):
-            raw_points = payload.get("points", [])
-        else:
-            raw_points = payload
-        if not isinstance(raw_points, list):
-            logger.warning(
-                "Ignoring RRMC PGDSF cost profile %s: expected a list or a {'points': [...]} object",
-                profile_path,
-            )
-            return []
-
-        points: list[tuple[float, float, float]] = []
-        for raw in raw_points:
-            if not isinstance(raw, dict):
-                continue
-            cached_tokens = raw.get("cached_tokens", raw.get("cached"))
-            non_cached_tokens = raw.get(
-                "non_cached_tokens", raw.get("new_tokens", raw.get("uncached_tokens"))
-            )
-            cost = raw.get(
-                "cost", raw.get("cost_ms", raw.get("latency_ms", raw.get("time_ms")))
-            )
-            try:
-                cached_tokens = float(cached_tokens)
-                non_cached_tokens = float(non_cached_tokens)
-                cost = float(cost)
-            except (TypeError, ValueError):
-                continue
-            if cached_tokens < 0 or non_cached_tokens <= 0 or cost <= 0:
-                continue
-            points.append((cached_tokens, non_cached_tokens, cost))
-
-        points.sort()
-        if not points:
-            logger.warning(
-                "RRMC PGDSF cost profile %s has no usable points", profile_path
-            )
-        return points
-
-    def _lookup_pgdsf_profile_cost(
-        self, cached_tokens: float, non_cached_tokens: float
-    ) -> Optional[float]:
-        profile = getattr(self, "rrmc_pgdsf_cost_profile", [])
-        if not profile:
-            return None
-
-        cached_axis = sorted({point[0] for point in profile})
-        non_cached_axis = sorted({point[1] for point in profile})
-        if not cached_axis or not non_cached_axis:
-            return None
-
-        def bounds(axis: list[float], value: float) -> tuple[float, float]:
-            pos = bisect.bisect_left(axis, value)
-            if pos <= 0:
-                return axis[0], axis[0]
-            if pos >= len(axis):
-                return axis[-1], axis[-1]
-            return axis[pos - 1], axis[pos]
-
-        x0, x1 = bounds(cached_axis, cached_tokens)
-        y0, y1 = bounds(non_cached_axis, non_cached_tokens)
-        profile_map = getattr(self, "rrmc_pgdsf_cost_profile_map", {})
-
-        def value_at(x: float, y: float) -> Optional[float]:
-            value = profile_map.get((x, y))
-            if value is not None:
-                return value
-            nearest = min(
-                profile,
-                key=lambda point: abs(point[0] - x) + abs(point[1] - y),
-            )
-            return nearest[2]
-
-        q00 = value_at(x0, y0)
-        q01 = value_at(x0, y1)
-        q10 = value_at(x1, y0)
-        q11 = value_at(x1, y1)
-        if q00 is None or q01 is None or q10 is None or q11 is None:
-            return None
-        if x0 == x1 and y0 == y1:
-            return q00
-        if x0 == x1:
-            weight = 0.0 if y1 == y0 else (non_cached_tokens - y0) / (y1 - y0)
-            return q00 * (1.0 - weight) + q01 * weight
-        if y0 == y1:
-            weight = 0.0 if x1 == x0 else (cached_tokens - x0) / (x1 - x0)
-            return q00 * (1.0 - weight) + q10 * weight
-
-        x_weight = (cached_tokens - x0) / (x1 - x0)
-        y_weight = (non_cached_tokens - y0) / (y1 - y0)
-        return (
-            q00 * (1.0 - x_weight) * (1.0 - y_weight)
-            + q10 * x_weight * (1.0 - y_weight)
-            + q01 * (1.0 - x_weight) * y_weight
-            + q11 * x_weight * y_weight
-        )
-
-    def _estimate_rrmc_recompute_cost(
-        self, cached_tokens: int, non_cached_tokens: int
-    ) -> float:
-        non_cached_tokens = max(1, int(non_cached_tokens))
-        cached_tokens = max(0, int(cached_tokens))
-        profiled_cost = self._lookup_pgdsf_profile_cost(
-            float(cached_tokens), float(non_cached_tokens)
-        )
-        if profiled_cost is not None:
-            return max(float(profiled_cost), 1e-6)
-        # Fallback approximates the profile-aware PGDSF trend without requiring
-        # a profiler: later documents are more expensive because they are
-        # computed at a longer prefix.
-        return float(non_cached_tokens) * (
-            1.0 + math.log2(float(cached_tokens) + 2.0)
-        )
-
-    def _rrmc_policy_size(self, node: TreeNode, *, kind: str) -> float:
-        if kind == "mamba":
-            if node.mamba_value is None:
-                return 1.0
-            return max(float(len(node.mamba_value)), 1.0)
-        if node.value is None:
-            return 1.0
-        return max(float(len(node.value)), 1.0)
-
-    def _rrmc_gdsf_cost(self, node: TreeNode, *, kind: str) -> float:
-        block_tokens = float(
-            getattr(
-                node,
-                "rrmc_block_tokens",
-                len(node.value) if node.value is not None else 1,
-            )
-        )
-        prefix_tokens = float(getattr(node, "rrmc_prefix_tokens", block_tokens))
-        if kind == "mamba":
-            return max(prefix_tokens, 1.0)
-        return max(block_tokens, 1.0)
-
-    def _rrmc_frequency(self, node: TreeNode, *, kind: str) -> float:
-        if kind == "mamba":
-            frequency = float(getattr(node, "rrmc_mamba_frequency", 0))
-            if frequency <= 0:
-                frequency = float(getattr(node, "accepted_mamba_hit_count", 0))
-            return max(frequency, 1.0)
-        frequency = float(getattr(node, "rrmc_full_frequency", 0))
-        if frequency <= 0:
-            frequency = float(getattr(node, "accepted_hit_count", 0))
-        return max(frequency, 1.0)
-
-    def _rrmc_clock_attr(self, policy: str, *, kind: str) -> str:
-        return f"rrmc_{kind}_{policy}_clock"
-
-    def _rrmc_priority_attr(self, policy: str, *, kind: str) -> str:
-        return f"rrmc_{kind}_{policy}_priority"
-
-    def _rrmc_pgdsf_cost_attr(self, suffix: str, *, kind: str) -> str:
-        return f"rrmc_{kind}_pgdsf_{suffix}"
-
-    def _record_rrmc_pgdsf_cost_sample(
-        self,
-        node: TreeNode,
-        *,
-        kind: str,
-        cached_tokens: int,
-        non_cached_tokens: int,
-    ) -> None:
-        cost = self._estimate_rrmc_recompute_cost(cached_tokens, non_cached_tokens)
-        cost_per_size = cost / self._rrmc_policy_size(node, kind=kind)
-        total_attr = self._rrmc_pgdsf_cost_attr("total_cost_per_size", kind=kind)
-        samples_attr = self._rrmc_pgdsf_cost_attr("cost_samples", kind=kind)
-        avg_attr = self._rrmc_pgdsf_cost_attr("avg_cost_per_size", kind=kind)
-        total = float(getattr(node, total_attr, 0.0)) + float(cost_per_size)
-        samples = int(getattr(node, samples_attr, 0)) + 1
-        setattr(node, total_attr, total)
-        setattr(node, samples_attr, samples)
-        setattr(node, avg_attr, total / max(samples, 1))
-
-    def _rrmc_pgdsf_cost_per_size(self, node: TreeNode, *, kind: str) -> float:
-        avg_attr = self._rrmc_pgdsf_cost_attr("avg_cost_per_size", kind=kind)
-        observed = float(getattr(node, avg_attr, 0.0))
-        if observed > 0:
-            return observed
-        block_tokens = int(
-            getattr(
-                node,
-                "rrmc_block_tokens",
-                len(node.value) if node.value is not None else 1,
-            )
-        )
-        prefix_tokens = int(getattr(node, "rrmc_prefix_tokens", block_tokens))
-        cached_tokens = max(0, prefix_tokens - block_tokens)
-        cost = self._estimate_rrmc_recompute_cost(cached_tokens, max(block_tokens, 1))
-        return cost / self._rrmc_policy_size(node, kind=kind)
-
-    def _refresh_rrmc_priority(self, node: TreeNode, *, kind: str) -> None:
-        frequency = self._rrmc_frequency(node, kind=kind)
-        size = self._rrmc_policy_size(node, kind=kind)
-        gdsf_clock = float(
-            getattr(self, self._rrmc_clock_attr("gdsf", kind=kind), 0.0)
-        )
-        pgdsf_clock = float(
-            getattr(self, self._rrmc_clock_attr("pgdsf", kind=kind), 0.0)
-        )
-        setattr(
-            node,
-            self._rrmc_priority_attr("gdsf", kind=kind),
-            gdsf_clock + frequency * self._rrmc_gdsf_cost(node, kind=kind) / size,
-        )
-        setattr(
-            node,
-            self._rrmc_priority_attr("pgdsf", kind=kind),
-            pgdsf_clock + frequency * self._rrmc_pgdsf_cost_per_size(node, kind=kind),
-        )
-
-    def _mark_rrmc_policy_access(
-        self,
-        req: Req,
-        node: TreeNode,
-        segment: RRMCSegmentSpec,
-        *,
-        kind: str,
-        duplicate_free_from: int,
-    ) -> None:
-        touched_attr = f"_rrmc_policy_touched_{kind}_nodes"
-        touched = getattr(req, touched_attr, None)
-        if touched is None:
-            touched = set()
-            setattr(req, touched_attr, touched)
-        if node.id in touched:
-            return
-        touched.add(node.id)
-
-        freq_attr = f"rrmc_{kind}_frequency"
-        setattr(node, freq_attr, int(getattr(node, freq_attr, 0)) + 1)
-        computed_start = max(segment.start, duplicate_free_from)
-        if computed_start < segment.end:
-            self._record_rrmc_pgdsf_cost_sample(
-                node,
-                kind=kind,
-                cached_tokens=computed_start,
-                non_cached_tokens=segment.end - computed_start,
-            )
-        self._refresh_rrmc_priority(node, kind=kind)
-
-    def _advance_rrmc_clock(
-        self, policy: str, *, kind: str, evicted_priority: float
-    ) -> None:
-        if policy not in ("gdsf", "pgdsf"):
-            return
-        clock_attr = self._rrmc_clock_attr(policy, kind=kind)
-        current = float(getattr(self, clock_attr, 0.0))
-        setattr(self, clock_attr, max(current, float(evicted_priority)))
 
     def record_rrmc_forced_chunk(
         self,
@@ -494,17 +203,9 @@ class RRMCMambaRadixCache(MambaRadixCache):
         node = getattr(req, "last_node", None)
         if not isinstance(node, TreeNode) or node is self.root_node:
             return
-        node.accepted_mamba_hit_count = (
-            int(getattr(node, "accepted_mamba_hit_count", 0)) + 1
-        )
         if node.mamba_value is not None:
             node.has_been_shared = True
             self.total_rrmc_accepted_state_hits += 1
-        self._refresh_rrmc_priority(node, kind="mamba")
-        while node is not None and node is not self.root_node:
-            node.accepted_hit_count = int(getattr(node, "accepted_hit_count", 0)) + 1
-            self._refresh_rrmc_priority(node, kind="full")
-            node = node.parent
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         req = params.req
@@ -538,9 +239,6 @@ class RRMCMambaRadixCache(MambaRadixCache):
 
         if best_value_len == 0:
             return self._empty_match_result()
-
-        for node in matched_nodes[:best_value_len]:
-            node.hit_count += 1
 
         if params.log_stats:
             self._log_rrmc_stats(
@@ -645,24 +343,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
 
         before_blocks = self._count_cached_blocks()
         before_tokens, _ = self._total_size_helper()
-
-        if self.rrmc_eviction_policy == "lru":
-            result = super().evict(params)
-        else:
-            full_num_evicted = 0
-            mamba_num_evicted = 0
-            if params.num_tokens > 0:
-                full_num_evicted = self._evict_full_custom(
-                    params.num_tokens, self.rrmc_eviction_policy
-                )
-            if params.mamba_num > 0:
-                mamba_num_evicted = self._evict_mamba_custom(
-                    params.mamba_num, self.rrmc_eviction_policy
-                )
-            result = EvictResult(
-                num_tokens_evicted=full_num_evicted,
-                mamba_num_evicted=mamba_num_evicted,
-            )
+        result = super().evict(params)
 
         after_blocks = self._count_cached_blocks()
         after_tokens, _ = self._total_size_helper()
@@ -1131,9 +812,6 @@ class RRMCMambaRadixCache(MambaRadixCache):
         node.value = kv_values.to(dtype=torch.int64, copy=True)
         node.mamba_value = None
         node.last_access_time = get_last_access_time()
-        node.hit_count = 1
-        node.accepted_hit_count = 0
-        node.accepted_mamba_hit_count = 0
         node.rrmc_tree_key = tree_key
         node.rrmc_block_identity = segment.block_identity
         node.rrmc_block_id = segment.block_id
@@ -1223,35 +901,11 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 if segment.end > duplicate_free_from:
                     duplicate_ranges.append((segment.start, segment.end))
             node = child
-            self._mark_rrmc_policy_access(
-                req,
-                child,
-                segment,
-                kind="full",
-                duplicate_free_from=duplicate_free_from,
-            )
-            if child.mamba_value is not None:
-                self._mark_rrmc_policy_access(
-                    req,
-                    child,
-                    segment,
-                    kind="mamba",
-                    duplicate_free_from=duplicate_free_from,
-                )
-
             if segment.is_block_end:
                 if self._was_rrmc_boundary_admission_skipped(req, segment.end):
                     continue
                 boundary_slot = self._consume_rrmc_boundary_slot(req, segment.end)
                 self._ensure_mamba_on_node(req, child, boundary_slot)
-                if child.mamba_value is not None:
-                    self._mark_rrmc_policy_access(
-                        req,
-                        child,
-                        segment,
-                        kind="mamba",
-                        duplicate_free_from=duplicate_free_from,
-                    )
 
         self._free_duplicate_ranges(kv_indices, duplicate_ranges, duplicate_free_from)
         last_mamba_node = self._nearest_mamba_node(node)
@@ -1346,202 +1000,6 @@ class RRMCMambaRadixCache(MambaRadixCache):
     def _free_finished_req_mamba(self, req: Req) -> None:
         if req.mamba_pool_idx is not None:
             self.req_to_token_pool.free_mamba_cache(req)
-
-    def _value_aware_priority(self, node: TreeNode) -> tuple[float, int, int, float]:
-        return (
-            float(getattr(node, "hit_count", 0)),
-            int(getattr(node, "rrmc_prefix_tokens", len(node.value))),
-            int(getattr(node, "rrmc_block_tokens", len(node.value))),
-            float(node.last_access_time),
-        )
-
-    def _policy_priority(
-        self, node: TreeNode, policy: str, *, kind: str = "full"
-    ) -> tuple[float, ...]:
-        if policy == "value_aware":
-            return self._value_aware_priority(node)
-
-        accepted_hit_count = float(getattr(node, "accepted_hit_count", 0))
-        accepted_mamba_hit_count = float(
-            getattr(node, "accepted_mamba_hit_count", 0)
-        )
-        last_access = float(node.last_access_time)
-
-        if policy == "lfu":
-            # RRMC LFU should reflect realized reuse, not lookup attempts.
-            if kind == "mamba":
-                return (accepted_mamba_hit_count, last_access)
-            return (accepted_hit_count, last_access)
-        if policy == "gdsf":
-            priority = float(
-                getattr(node, self._rrmc_priority_attr("gdsf", kind=kind), 0.0)
-            )
-            if priority <= 0:
-                priority = (
-                    float(
-                        getattr(
-                            self, self._rrmc_clock_attr("gdsf", kind=kind), 0.0
-                        )
-                    )
-                    + self._rrmc_frequency(node, kind=kind)
-                    * self._rrmc_gdsf_cost(node, kind=kind)
-                    / self._rrmc_policy_size(node, kind=kind)
-                )
-            return (priority, last_access)
-        if policy == "pgdsf":
-            priority = float(
-                getattr(node, self._rrmc_priority_attr("pgdsf", kind=kind), 0.0)
-            )
-            if priority <= 0:
-                priority = (
-                    float(
-                        getattr(
-                            self, self._rrmc_clock_attr("pgdsf", kind=kind), 0.0
-                        )
-                    )
-                    + self._rrmc_frequency(node, kind=kind)
-                    * self._rrmc_pgdsf_cost_per_size(node, kind=kind)
-                )
-            return (priority, last_access)
-
-        return self._value_aware_priority(node)
-
-    def _normalized(self, values: list[float]) -> list[float]:
-        if not values:
-            return []
-        lower = min(values)
-        upper = max(values)
-        if upper <= lower:
-            return [1.0 for _ in values]
-        scale = upper - lower
-        return [(value - lower) / scale for value in values]
-
-    def _marconi_memory_cost(self, node: TreeNode, *, kind: str) -> float:
-        if kind == "mamba":
-            if node.mamba_value is None:
-                return 0.0
-            return float(len(node.mamba_value))
-        return float(len(node.value)) if node.value is not None else 0.0
-
-    def _marconi_flop_efficiency(self, node: TreeNode, *, kind: str) -> float:
-        memory_cost = max(self._marconi_memory_cost(node, kind=kind), 1.0)
-        prefix_tokens = float(getattr(node, "rrmc_prefix_tokens", len(node.value)))
-        return prefix_tokens / memory_cost
-
-    def _select_marconi_candidate(
-        self, candidates: list[TreeNode], *, kind: str
-    ) -> Optional[TreeNode]:
-        if not candidates:
-            return None
-        recencies = self._normalized(
-            [float(node.last_access_time) for node in candidates]
-        )
-        efficiencies = self._normalized(
-            [self._marconi_flop_efficiency(node, kind=kind) for node in candidates]
-        )
-
-        best_node: Optional[TreeNode] = None
-        best_score: Optional[tuple[float, float]] = None
-        for node, recency, efficiency in zip(candidates, recencies, efficiencies):
-            utility = recency + self.rrmc_marconi_alpha * efficiency
-            score = (utility, float(node.last_access_time))
-            if best_score is None or score < best_score:
-                best_score = score
-                best_node = node
-        return best_node
-
-    def _select_full_candidate(self, policy: str) -> Optional[TreeNode]:
-        candidates = [
-            node
-            for node in self._collect_all_nodes()
-            if node is not self.root_node
-            and len(node.children) == 0
-            and node.full_lock_ref == 0
-            and node.value is not None
-        ]
-        if not candidates:
-            return None
-        if policy == "marconi":
-            # Marconi considers low-fanout entries for eviction, but RRMC's
-            # segment KV ownership is leaf-based today, so we keep full-KV
-            # eviction leaf-only and only change the scoring function.
-            return self._select_marconi_candidate(candidates, kind="full")
-        return min(
-            candidates,
-            key=lambda node: self._policy_priority(node, policy, kind="full"),
-        )
-
-    def _select_mamba_candidate(self, policy: str) -> Optional[TreeNode]:
-        candidates = [
-            node
-            for node in self._collect_nontombstone_nodes()
-            if node is not self.root_node
-            and node.mamba_lock_ref == 0
-            and node.mamba_value is not None
-        ]
-        if not candidates:
-            return None
-        if policy == "marconi":
-            marconi_candidates = [
-                node for node in candidates if len(node.children) <= 1
-            ]
-            if marconi_candidates:
-                return self._select_marconi_candidate(
-                    marconi_candidates, kind="mamba"
-                )
-        return min(
-            candidates,
-            key=lambda node: self._policy_priority(node, policy, kind="mamba"),
-        )
-
-    def _evict_full_custom(self, num_tokens: int, policy: str) -> int:
-        full_num_evicted = 0
-        while full_num_evicted < num_tokens:
-            node = self._select_full_candidate(policy)
-            if node is None:
-                break
-            full_priority = self._policy_priority(node, policy, kind="full")[0]
-            mamba_priority = self._policy_priority(node, policy, kind="mamba")[0]
-            full_num_evicted_delta, _, _, _ = self._evict_leaf_node(node, False)
-            full_num_evicted += full_num_evicted_delta
-            if full_num_evicted_delta > 0:
-                self._advance_rrmc_clock(
-                    policy, kind="full", evicted_priority=full_priority
-                )
-                self._advance_rrmc_clock(
-                    policy, kind="mamba", evicted_priority=mamba_priority
-                )
-        return full_num_evicted
-
-    def _evict_mamba_custom(self, mamba_num: int, policy: str) -> int:
-        mamba_num_evicted = 0
-        while mamba_num_evicted < mamba_num:
-            node = self._select_mamba_candidate(policy)
-            if node is None:
-                break
-            assert node.mamba_value is not None, f"node has no mamba value, {node.id=}"
-            mamba_priority = self._policy_priority(node, policy, kind="mamba")[0]
-            full_priority = self._policy_priority(node, policy, kind="full")[0]
-            if len(node.children) > 0:
-                self.req_to_token_pool.mamba_pool.free(node.mamba_value)
-                self.mamba_lru_list.remove_node(node)
-                self._tombstone_internal_node(node)
-                mamba_num_evicted += 1
-                self._advance_rrmc_clock(
-                    policy, kind="mamba", evicted_priority=mamba_priority
-                )
-            else:
-                full_delta, delta, _, _ = self._evict_leaf_node(node, True)
-                mamba_num_evicted += delta
-                if full_delta > 0:
-                    self._advance_rrmc_clock(
-                        policy, kind="full", evicted_priority=full_priority
-                    )
-                if delta > 0:
-                    self._advance_rrmc_clock(
-                        policy, kind="mamba", evicted_priority=mamba_priority
-                    )
-        return mamba_num_evicted
 
     def _count_cached_blocks(self) -> int:
         return sum(
