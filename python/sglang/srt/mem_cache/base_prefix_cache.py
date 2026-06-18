@@ -41,6 +41,7 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    log_stats: bool = True
 
 
 @dataclasses.dataclass
@@ -223,6 +224,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def pretty_print(self):
         raise NotImplementedError()
+
+    def get_cache_metrics(self) -> dict[str, Any]:
+        return {}
 
     def init_load_back(
         self,

@@ -174,6 +174,7 @@ NSA_CHOICES = [
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
+RRMC_RADIX_EVICTION_POLICY_CHOICES = ["lru"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -356,6 +357,10 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    enable_rrmc_radix_cache: bool = False
+    rrmc_radix_eviction_policy: str = "lru"
+    enable_rrmc_admission: bool = False
+    rrmc_admission_min_accesses: int = 2
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -554,6 +559,7 @@ class ServerArgs:
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
+    host_mamba_full_memory_ratio: Optional[float] = None
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
@@ -4007,6 +4013,35 @@ class ServerArgs:
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used.",
         )
         parser.add_argument(
+            "--enable-rrmc-radix-cache",
+            action="store_true",
+            help="Enable the RRMC block-aware radix cache for hybrid SSM models.",
+        )
+        parser.add_argument(
+            "--rrmc-radix-eviction-policy",
+            type=str,
+            choices=RRMC_RADIX_EVICTION_POLICY_CHOICES,
+            default=ServerArgs.rrmc_radix_eviction_policy,
+            help="Eviction policy for the RRMC block-aware radix cache. Only LRU is supported.",
+        )
+        parser.add_argument(
+            "--enable-rrmc-admission",
+            action="store_true",
+            help=(
+                "Enable RRMC boundary-state admission. When enabled, cold blocks "
+                "are observed before allocating reusable Mamba state slots."
+            ),
+        )
+        parser.add_argument(
+            "--rrmc-admission-min-accesses",
+            type=int,
+            default=ServerArgs.rrmc_admission_min_accesses,
+            help=(
+                "Minimum observed accesses before RRMC captures a block boundary "
+                "Mamba state when --enable-rrmc-admission is set."
+            ),
+        )
+        parser.add_argument(
             "--enable-prefill-delayer",
             action="store_true",
             help="Enable prefill delayer for DP attention to reduce idle time.",
@@ -5083,6 +5118,16 @@ class ServerArgs:
             type=int,
             default=ServerArgs.hicache_size,
             help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        )
+        parser.add_argument(
+            "--host-mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.host_mamba_full_memory_ratio,
+            help=(
+                "Optional host-side ratio of Mamba state memory to full KV host "
+                "memory for hybrid HiCache. If unset, the Mamba host pool uses "
+                "--hicache-ratio/--hicache-size like the KV host pool."
+            ),
         )
         parser.add_argument(
             "--hicache-write-policy",

@@ -1266,8 +1266,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    # For chunked prefill in PP
+    # For unfinished chunked prefill requests tracked across batches.
     chunked_req: Optional[Req] = None
+    chunked_reqs: Optional[List[Req]] = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -1288,6 +1289,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+
+    # RRMC operator-boundary state capture metadata
+    rrmc_enabled: bool = False
+    rrmc_boundary_req_indices: Optional[torch.Tensor] = None
+    rrmc_boundary_block_ends: Optional[torch.Tensor] = None
+    rrmc_boundary_local_starts: Optional[torch.Tensor] = None
+    rrmc_boundary_local_ends: Optional[torch.Tensor] = None
+    rrmc_boundary_mamba_indices: Optional[torch.Tensor] = None
+    rrmc_boundary_req_indices_cpu: Optional[List[int]] = None
+    rrmc_boundary_block_ends_cpu: Optional[List[int]] = None
+    rrmc_boundary_local_starts_cpu: Optional[List[int]] = None
+    rrmc_boundary_local_ends_cpu: Optional[List[int]] = None
+    rrmc_boundary_mamba_indices_cpu: Optional[List[int]] = None
+    rrmc_boundaries_by_req: Optional[Dict[int, List[Tuple[int, int, int]]]] = None
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -1388,6 +1403,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
+        chunked_reqs: Optional[List[Req]] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1395,6 +1411,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         is_hybrid_swa = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             is_hybrid_swa = True
+
+        resolved_chunked_reqs = (
+            list(chunked_reqs)
+            if chunked_reqs is not None
+            else ([chunked_req] if chunked_req is not None else [])
+        )
 
         return cls(
             reqs=reqs,
@@ -1412,7 +1434,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
-            chunked_req=chunked_req,
+            chunked_req=resolved_chunked_reqs[0] if resolved_chunked_reqs else None,
+            chunked_reqs=resolved_chunked_reqs,
             dllm_config=dllm_config,
         )
 
@@ -1559,6 +1582,58 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self
         )
 
+        self.rrmc_enabled = False
+        self.rrmc_boundary_req_indices = None
+        self.rrmc_boundary_block_ends = None
+        self.rrmc_boundary_local_starts = None
+        self.rrmc_boundary_local_ends = None
+        self.rrmc_boundary_mamba_indices = None
+        self.rrmc_boundary_req_indices_cpu = None
+        self.rrmc_boundary_block_ends_cpu = None
+        self.rrmc_boundary_local_starts_cpu = None
+        self.rrmc_boundary_local_ends_cpu = None
+        self.rrmc_boundary_mamba_indices_cpu = None
+        self.rrmc_boundaries_by_req = None
+
+        prepare_rrmc_boundaries = getattr(
+            self.tree_cache, "prepare_rrmc_forward_boundaries", None
+        )
+        if callable(prepare_rrmc_boundaries):
+            rrmc_boundaries = prepare_rrmc_boundaries(reqs, prefix_lens, extend_lens)
+            if rrmc_boundaries is not None and rrmc_boundaries.boundaries:
+                self.rrmc_enabled = True
+                self.rrmc_boundary_req_indices_cpu = rrmc_boundaries.req_indices
+                self.rrmc_boundary_block_ends_cpu = rrmc_boundaries.block_ends
+                self.rrmc_boundary_local_starts_cpu = rrmc_boundaries.local_starts
+                self.rrmc_boundary_local_ends_cpu = rrmc_boundaries.local_ends
+                self.rrmc_boundary_mamba_indices_cpu = rrmc_boundaries.mamba_indices
+                self.rrmc_boundaries_by_req = rrmc_boundaries.boundaries_by_req
+                self.rrmc_boundary_req_indices = torch.tensor(
+                    self.rrmc_boundary_req_indices_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self.rrmc_boundary_block_ends = torch.tensor(
+                    self.rrmc_boundary_block_ends_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self.rrmc_boundary_local_starts = torch.tensor(
+                    self.rrmc_boundary_local_starts_cpu,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.rrmc_boundary_local_ends = torch.tensor(
+                    self.rrmc_boundary_local_ends_cpu,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.rrmc_boundary_mamba_indices = torch.tensor(
+                    self.rrmc_boundary_mamba_indices_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+
         # Set fields
         input_embeds = []
         extend_input_logprob_token_ids = []
@@ -1566,6 +1641,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
+        record_accepted_hit_tokens = getattr(
+            self.tree_cache, "record_accepted_hit_tokens", None
+        )
+        if not callable(record_accepted_hit_tokens):
+            record_accepted_hit_tokens = None
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1592,6 +1672,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed
                 req.cached_tokens += new_cached
+                if record_accepted_hit_tokens is not None:
+                    record_accepted_hit_tokens(new_cached, req=req)
 
                 # Calculate detailed breakdown of cached tokens by source (for HiCache)
                 # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
@@ -1760,6 +1842,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
+
+        disable_rrmc_tracking_fn = getattr(
+            self.tree_cache, "rrmc_disable_operator_chunk_state_tracking", None
+        )
+        if (
+            callable(disable_rrmc_tracking_fn)
+            and disable_rrmc_tracking_fn(req)
+        ):
+            mamba_track_mask_cpu.append(False)
+            mamba_track_indices_cpu.append(
+                req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
+            )
+            req.mamba_last_track_seqlen = None
+            mamba_track_seqlens_cpu.append(-1)
+            return
 
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
         mask = req.extend_input_len >= mamba_cache_chunk_size
@@ -2347,6 +2444,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            rrmc_enabled=self.rrmc_enabled,
+            rrmc_boundary_req_indices=self.rrmc_boundary_req_indices,
+            rrmc_boundary_block_ends=self.rrmc_boundary_block_ends,
+            rrmc_boundary_local_starts=self.rrmc_boundary_local_starts,
+            rrmc_boundary_local_ends=self.rrmc_boundary_local_ends,
+            rrmc_boundary_mamba_indices=self.rrmc_boundary_mamba_indices,
+            rrmc_boundary_req_indices_cpu=self.rrmc_boundary_req_indices_cpu,
+            rrmc_boundary_block_ends_cpu=self.rrmc_boundary_block_ends_cpu,
+            rrmc_boundary_local_starts_cpu=self.rrmc_boundary_local_starts_cpu,
+            rrmc_boundary_local_ends_cpu=self.rrmc_boundary_local_ends_cpu,
+            rrmc_boundary_mamba_indices_cpu=self.rrmc_boundary_mamba_indices_cpu,
+            rrmc_boundaries_by_req=self.rrmc_boundaries_by_req,
         )
 
     def copy(self):
@@ -2541,3 +2650,17 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # RRMC operator-boundary state capture metadata
+    rrmc_enabled: bool = False
+    rrmc_boundary_req_indices: Optional[torch.Tensor] = None
+    rrmc_boundary_block_ends: Optional[torch.Tensor] = None
+    rrmc_boundary_local_starts: Optional[torch.Tensor] = None
+    rrmc_boundary_local_ends: Optional[torch.Tensor] = None
+    rrmc_boundary_mamba_indices: Optional[torch.Tensor] = None
+    rrmc_boundary_req_indices_cpu: Optional[List[int]] = None
+    rrmc_boundary_block_ends_cpu: Optional[List[int]] = None
+    rrmc_boundary_local_starts_cpu: Optional[List[int]] = None
+    rrmc_boundary_local_ends_cpu: Optional[List[int]] = None
+    rrmc_boundary_mamba_indices_cpu: Optional[List[int]] = None
+    rrmc_boundaries_by_req: Optional[Dict[int, List[Tuple[int, int, int]]]] = None

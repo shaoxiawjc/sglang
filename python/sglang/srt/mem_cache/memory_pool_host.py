@@ -1182,6 +1182,8 @@ class MambaPoolHost(HostKVCache):
         device_pool: MambaPool,
         host_to_device_ratio: float,
         host_size: int,
+        host_token_capacity: Optional[int] = None,
+        allow_host_smaller_than_device: bool = False,
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
@@ -1210,7 +1212,9 @@ class MambaPoolHost(HostKVCache):
         self.dtype = self.conv_dtype
         self.size_per_token = self.get_size_per_token()
 
-        if host_size > 0:
+        if host_token_capacity is not None:
+            self.size = int(host_token_capacity)
+        elif host_size > 0:
             self.size = int(host_size * 1e9 // self.size_per_token)
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
@@ -1218,9 +1222,12 @@ class MambaPoolHost(HostKVCache):
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        if not allow_host_smaller_than_device:
+            assert (
+                self.size > device_pool.size
+            ), "The host memory should be larger than the device memory with the current protocol"
+        elif self.size <= 0:
+            raise ValueError("Mamba host memory capacity must be positive.")
 
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
@@ -1357,6 +1364,12 @@ class MambaPoolHost(HostKVCache):
         return int(tensor[0].numel() * tensor.element_size())
 
     @staticmethod
+    def _cuda_indices_for_kernel(indices: torch.Tensor, device: torch.device | str):
+        if indices.is_cuda:
+            return indices
+        return indices.to(device=device, non_blocking=True)
+
+    @staticmethod
     def _copy_tensor(
         src: torch.Tensor,
         dst: torch.Tensor,
@@ -1367,6 +1380,13 @@ class MambaPoolHost(HostKVCache):
         if src_indices.numel() == 0:
             return
         if io_backend == "kernel":
+            index_device = src.device if src.is_cuda else dst.device
+            src_indices = MambaPoolHost._cuda_indices_for_kernel(
+                src_indices, index_device
+            )
+            dst_indices = MambaPoolHost._cuda_indices_for_kernel(
+                dst_indices, index_device
+            )
             # TODO: Rename the interface for clarity.
             # Here, transfer_kv_per_layer_mla is reused to transfer the Mamba state.
             # This has nothing to do with MLA; it's only reused because this interface happens to transfer a single Pool.
@@ -1401,6 +1421,13 @@ class MambaPoolHost(HostKVCache):
         if src_indices.numel() == 0:
             return
         if io_backend == "kernel":
+            index_device = src.device if src.is_cuda else dst.device
+            src_indices = MambaPoolHost._cuda_indices_for_kernel(
+                src_indices, index_device
+            )
+            dst_indices = MambaPoolHost._cuda_indices_for_kernel(
+                dst_indices, index_device
+            )
             item_size = MambaPoolHost._item_size_per_index(dst)
             transfer_kv_per_layer_mla_pf_lf(
                 src=src,
@@ -1436,6 +1463,13 @@ class MambaPoolHost(HostKVCache):
         if src_indices.numel() == 0:
             return
         if io_backend == "kernel":
+            index_device = src_layers.device if src_layers.is_cuda else dst.device
+            src_indices = MambaPoolHost._cuda_indices_for_kernel(
+                src_indices, index_device
+            )
+            dst_indices = MambaPoolHost._cuda_indices_for_kernel(
+                dst_indices, index_device
+            )
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
             src_ptrs = torch.tensor(
                 [src_layers[i].data_ptr() for i in range(num_layers)],
@@ -1676,16 +1710,19 @@ class HostPoolGroup:
         pool_transfers: Optional[list] = None,
     ) -> None:
         # 1. Anchor (KV) backup
-        self.anchor_entry.host_pool.backup_from_device_all_layer(
-            self.anchor_entry.device_pool,
-            host_indices,
-            device_indices,
-            io_backend,
-        )
+        if host_indices.numel() > 0:
+            self.anchor_entry.host_pool.backup_from_device_all_layer(
+                self.anchor_entry.device_pool,
+                host_indices,
+                device_indices,
+                io_backend,
+            )
         # 2. Extra pool backup
         for transfer in pool_transfers or []:
             entry = self.entry_map.get(transfer.name)
             if entry is None or transfer.host_indices is None:
+                continue
+            if transfer.host_indices.numel() == 0:
                 continue
             entry.host_pool.backup_from_device_all_layer(
                 entry.device_pool,

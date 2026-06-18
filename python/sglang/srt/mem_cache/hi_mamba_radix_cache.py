@@ -10,6 +10,7 @@ import time
 from queue import Empty
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -128,10 +129,47 @@ class HiMambaRadixCache(MambaRadixCache):
             server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
+        mamba_host_token_capacity = None
+        allow_mamba_host_smaller_than_device = False
+        if server_args.host_mamba_full_memory_ratio is not None:
+            full_kv_host_bytes = (
+                self.full_kv_pool_host.size * self.full_kv_pool_host.size_per_token
+            )
+            target_mamba_host_bytes = (
+                full_kv_host_bytes * server_args.host_mamba_full_memory_ratio
+            )
+            mamba_device_pool = params.req_to_token_pool.mamba_pool
+            conv_total_size = 0
+            for conv_state in mamba_device_pool.mamba_cache.conv:
+                conv_total_size += (
+                    int(np.prod(conv_state.shape[2:])) * conv_state.dtype.itemsize
+                )
+            temporal_size = (
+                int(np.prod(mamba_device_pool.mamba_cache.temporal.shape[2:]))
+                * mamba_device_pool.mamba_cache.temporal.dtype.itemsize
+            )
+            mamba_size_per_token = (
+                conv_total_size + temporal_size
+            ) * mamba_device_pool.num_mamba_layers
+            mamba_host_token_capacity = max(
+                1, int(target_mamba_host_bytes // mamba_size_per_token)
+            )
+            allow_mamba_host_smaller_than_device = True
+            logger.info(
+                "Using explicit host Mamba/full KV memory ratio %.6g: "
+                "full_kv_host_bytes=%.2f GB, target_mamba_host_bytes=%.2f GB, "
+                "mamba_host_token_capacity=%s",
+                server_args.host_mamba_full_memory_ratio,
+                full_kv_host_bytes / 1e9,
+                target_mamba_host_bytes / 1e9,
+                mamba_host_token_capacity,
+            )
         self.mamba_pool_host = MambaPoolHost(
             params.req_to_token_pool.mamba_pool,
             server_args.hicache_ratio,
             server_args.hicache_size,
+            host_token_capacity=mamba_host_token_capacity,
+            allow_host_smaller_than_device=allow_mamba_host_smaller_than_device,
             allocator_type=server_args.hicache_storage_backend,
             layout=server_args.hicache_mem_layout,
         )
@@ -1058,7 +1096,11 @@ class HiMambaRadixCache(MambaRadixCache):
             last_device_node = last_device_node.parent
 
         last_host_node = best_last_node
-        while last_host_node is not self.root_node and not last_host_node.backuped:
+        while (
+            last_host_node is not self.root_node
+            and not last_host_node.backuped
+            and not last_host_node.mamba_backuped
+        ):
             last_host_node = last_host_node.parent
 
         mamba_host_hit = (
@@ -1105,6 +1147,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self.evictable_full_device_leaves.discard(child)
 
         new_node = super()._split_node(key, child, split_len)
+        new_node.hit_count = child.hit_count
 
         if child.backuped:
             new_node.host_value = child.host_value[:split_len].clone()
@@ -1132,6 +1175,7 @@ class HiMambaRadixCache(MambaRadixCache):
         new_node.full_lock_ref = child.full_lock_ref
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
+        new_node.hit_count = child.hit_count
 
         if child.backuped:
             new_node.host_value = child.host_value[:split_len].clone()

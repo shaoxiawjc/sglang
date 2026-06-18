@@ -308,6 +308,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
 
+    # RRMC operator-boundary state capture metadata
+    rrmc_enabled: bool = False
+    rrmc_boundary_req_indices: Optional[torch.Tensor] = None
+    rrmc_boundary_block_ends: Optional[torch.Tensor] = None
+    rrmc_boundary_local_starts: Optional[torch.Tensor] = None
+    rrmc_boundary_local_ends: Optional[torch.Tensor] = None
+    rrmc_boundary_mamba_indices: Optional[torch.Tensor] = None
+    rrmc_boundary_req_indices_cpu: Optional[List[int]] = None
+    rrmc_boundary_block_ends_cpu: Optional[List[int]] = None
+    rrmc_boundary_local_starts_cpu: Optional[List[int]] = None
+    rrmc_boundary_local_ends_cpu: Optional[List[int]] = None
+    rrmc_boundary_mamba_indices_cpu: Optional[List[int]] = None
+    rrmc_boundaries_by_req: Optional[Dict[int, List[Tuple[int, int, int]]]] = None
+    rrmc_segments_by_req: Optional[
+        List[List[Tuple[int, int, int, bool, int]]]
+    ] = None
+
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
 
@@ -448,6 +465,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
+            rrmc_enabled=batch.rrmc_enabled,
+            rrmc_boundary_req_indices=batch.rrmc_boundary_req_indices,
+            rrmc_boundary_block_ends=batch.rrmc_boundary_block_ends,
+            rrmc_boundary_local_starts=batch.rrmc_boundary_local_starts,
+            rrmc_boundary_local_ends=batch.rrmc_boundary_local_ends,
+            rrmc_boundary_mamba_indices=batch.rrmc_boundary_mamba_indices,
+            rrmc_boundary_req_indices_cpu=batch.rrmc_boundary_req_indices_cpu,
+            rrmc_boundary_block_ends_cpu=batch.rrmc_boundary_block_ends_cpu,
+            rrmc_boundary_local_starts_cpu=batch.rrmc_boundary_local_starts_cpu,
+            rrmc_boundary_local_ends_cpu=batch.rrmc_boundary_local_ends_cpu,
+            rrmc_boundary_mamba_indices_cpu=batch.rrmc_boundary_mamba_indices_cpu,
+            rrmc_boundaries_by_req=batch.rrmc_boundaries_by_req,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,

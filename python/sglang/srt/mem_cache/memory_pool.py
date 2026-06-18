@@ -337,12 +337,19 @@ class MambaPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+    def _alloc_slots(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > len(self.free_slots):
             return None
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        return select_index
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        select_index = self._alloc_slots(need_size)
+        if select_index is None:
+            return None
+
         # clear at alloc time — expand a scalar GPU zero to the right shape, no CPU-GPU sync
         for i in range(len(self.mamba_cache.conv)):
             t = self.mamba_cache.conv[i]
@@ -357,6 +364,9 @@ class MambaPool:
         t[:, select_index] = z
 
         return select_index
+
+    def alloc_uninitialized(self, need_size: int) -> Optional[torch.Tensor]:
+        return self._alloc_slots(need_size)
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
