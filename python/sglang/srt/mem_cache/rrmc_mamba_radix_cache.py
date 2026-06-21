@@ -359,6 +359,80 @@ class RRMCMambaRadixCache(MambaRadixCache):
 
         return result
 
+    def _is_mamba_device_leaf_evictable_node(self, node: TreeNode) -> bool:
+        return (
+            node is not self.root_node
+            and node.value is not None
+            and node.mamba_value is not None
+            and len(node.children) == 0
+            and node.full_lock_ref == 0
+            and node.mamba_lock_ref == 0
+        )
+
+    def mamba_evictable_size(self) -> int:
+        return sum(
+            len(node.mamba_value)
+            for node in self.mamba_lru_list.cache.values()
+            if self._is_mamba_device_leaf_evictable_node(node)
+        )
+
+    def sanity_check(self):
+        if self.disable:
+            return
+        self.full_lru_list.sanity_check(self)
+        self._sanity_check_rrmc_mamba_lru()
+
+    def _sanity_check_rrmc_mamba_lru(self) -> None:
+        lru_count = 0
+        node = self.mamba_lru_list.tail.mamba_prev
+        while node is not self.mamba_lru_list.head:
+            assert node.id in self.mamba_lru_list.cache, (
+                f"mamba LRU node missing from cache, {node.id=}"
+            )
+            assert node.mamba_value is not None, (
+                f"RRMC mamba LRU contains tombstone node, {node.id=}"
+            )
+            lru_count += 1
+            node = node.mamba_prev
+        assert lru_count == len(self.mamba_lru_list.cache), (
+            f"RRMC mamba LRU count mismatch, {lru_count=} "
+            f"cache={len(self.mamba_lru_list.cache)}"
+        )
+
+    def evict_mamba(self, mamba_num: int) -> int:
+        """Evict RRMC Mamba states through leaf KV+Mamba eviction.
+
+        RRMC document-boundary Mamba states are only useful together with the KV
+        path to that same boundary. Do not tombstone internal Mamba nodes
+        independently; instead, evict only tree leaves and let the existing leaf
+        deletion path cascade tombstone parents.
+        """
+        if self.disable or mamba_num <= 0:
+            return 0
+
+        x = self.mamba_lru_list.get_lru_no_lock()
+        mamba_num_evicted = 0
+        while mamba_num_evicted < mamba_num and self.mamba_lru_list.in_list(x):
+            assert x is not None
+            assert x != self.root_node, f"root node is not evictable, {x.id=}"
+            assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
+            assert x.mamba_lock_ref == 0, f"node is in use by mamba indices, {x.id=}"
+
+            x_next = self.mamba_lru_list.get_prev_no_lock(x)
+            if not self._is_mamba_device_leaf_evictable_node(x):
+                x = x_next
+                continue
+
+            _, mamba_evicted_delta, _, x_next = self._evict_leaf_node(
+                x, is_evict_mamba=True
+            )
+            mamba_num_evicted += mamba_evicted_delta
+            if not self.mamba_lru_list.in_list(x_next):
+                x_next = self.mamba_lru_list.get_lru_no_lock()
+            x = x_next
+
+        return mamba_num_evicted
+
     def _delete_leaf(self, node: TreeNode) -> None:
         assert node.mamba_value is not None, (
             f"Invariant violated: RRMC leaf node must carry mamba, {node.id=}"
