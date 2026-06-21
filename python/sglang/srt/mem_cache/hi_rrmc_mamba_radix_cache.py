@@ -493,7 +493,7 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         return sum(
             len(node.mamba_value)
             for node in self.mamba_lru_list.cache.values()
-            if self._is_mamba_device_evictable_node(node)
+            if node.mamba_value is not None and node.mamba_lock_ref == 0
         )
 
     def full_protected_size(self) -> int:
