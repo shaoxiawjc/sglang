@@ -31,8 +31,13 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         self._rrmc_write_back_node_ids: set[int] = set()
         HiMambaRadixCache.__init__(self, params=params, server_args=server_args)
         self._init_rrmc_runtime_fields(server_args)
+        self._init_rrmc_eviction_policy(params, server_args)
         logger.info(
-            "Initialized HiRRMCMambaRadixCache with segment_size=%s, admission=%s, admission_min_accesses=%s",
+            "Initialized HiRRMCMambaRadixCache with eviction policy=%s, "
+            "ours_alpha=%s, segment_size=%s, admission=%s, "
+            "admission_min_accesses=%s",
+            self.rrmc_radix_eviction_policy,
+            self.ours_evict_alpha,
             self.rrmc_segment_size,
             self.enable_rrmc_admission,
             self.rrmc_admission_min_accesses,
@@ -680,7 +685,76 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         self._update_full_device_leaf_status(node.parent)
         return num_full, mamba_num
 
+    def _evict_full_ours(self, full_num_tokens: int) -> int:
+        if self.disable or full_num_tokens <= 0:
+            return 0
+
+        full_num_evicted = 0
+        skipped_ids: set[int] = set()
+        while full_num_evicted < full_num_tokens:
+            candidates = sorted(
+                (
+                    node
+                    for node in self.evictable_full_device_leaves
+                    if node.id not in skipped_ids
+                    and self._is_full_device_evictable_node(node)
+                ),
+                key=lambda node: node.last_access_time,
+            )
+            x = self._select_ours_candidate(candidates, memory_kind="device_full")
+            if x is None:
+                break
+
+            evicted_full, evicted_mamba = self._evict_device_leaf(x)
+            if evicted_full <= 0 and evicted_mamba <= 0:
+                skipped_ids.add(x.id)
+                continue
+            full_num_evicted += evicted_full
+            self._ours_full_mamba_evicted = (
+                getattr(self, "_ours_full_mamba_evicted", 0) + evicted_mamba
+            )
+            skipped_ids.clear()
+
+        return full_num_evicted
+
+    def _evict_mamba_ours(self, mamba_num: int) -> int:
+        if self.disable or mamba_num <= 0:
+            return 0
+
+        mamba_num_evicted = 0
+        skipped_ids: set[int] = set()
+        while mamba_num_evicted < mamba_num:
+            candidates = [
+                node
+                for node in self._collect_lru_stream_candidates(
+                    self.mamba_lru_list,
+                    leaf_only=False,
+                    excluded_ids=skipped_ids,
+                )
+                if len(node.children) > 0 or self._is_full_device_evictable_node(node)
+            ]
+            x = self._select_ours_candidate(candidates, memory_kind="device_mamba")
+            if x is None:
+                break
+
+            assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
+            assert x != self.root_node, f"root node is not evictable, {x.id=}"
+            assert x.mamba_lock_ref == 0, f"node is in use, {x.id=}"
+
+            if len(x.children) > 0:
+                mamba_num_evicted += self._free_device_mamba_for_node(x)
+            else:
+                evicted_full, evicted_mamba = self._evict_device_leaf(x)
+                if evicted_full <= 0 and evicted_mamba <= 0:
+                    skipped_ids.add(x.id)
+                    continue
+                mamba_num_evicted += evicted_mamba
+            skipped_ids.clear()
+        return mamba_num_evicted
+
     def evict_mamba(self, mamba_num: int) -> int:
+        if self.rrmc_radix_eviction_policy == "ours":
+            return self._evict_mamba_ours(mamba_num)
         if self.disable or mamba_num <= 0:
             return 0
 
@@ -711,7 +785,43 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
 
         return mamba_num_evicted
 
+    def _evict_mamba_host_ours(self, num_mamba_hosts: int) -> int:
+        if self.disable or num_mamba_hosts <= 0:
+            return 0
+
+        num_evicted = 0
+        skipped_ids: set[int] = set()
+        while num_evicted < num_mamba_hosts:
+            candidates = [
+                node
+                for node in self._collect_lru_stream_candidates(
+                    self.mamba_host_lru_list,
+                    leaf_only=False,
+                    excluded_ids=skipped_ids,
+                )
+                if node.host_ref_counter == 0
+            ]
+            x = self._select_ours_candidate(candidates, memory_kind="host_mamba")
+            if x is None:
+                break
+
+            if len(x.children) == 0 and x in self.evictable_full_host_leaves:
+                if self._evict_host_leaf(x) > 0:
+                    num_evicted += 1
+                    skipped_ids.clear()
+                else:
+                    skipped_ids.add(x.id)
+            else:
+                if self._free_host_mamba_for_node(x) > 0:
+                    num_evicted += 1
+                    skipped_ids.clear()
+                else:
+                    skipped_ids.add(x.id)
+        return num_evicted
+
     def evict_mamba_host(self, num_mamba_hosts: int) -> int:
+        if self.rrmc_radix_eviction_policy == "ours":
+            return self._evict_mamba_host_ours(num_mamba_hosts)
         if self.disable or num_mamba_hosts <= 0:
             return 0
 
@@ -734,6 +844,38 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
                 x_next = self.mamba_host_lru_list.get_lru_no_lock()
             x = x_next
         return num_evicted
+
+    def _evict_host_full_ours(self, num_tokens: int) -> int:
+        if self.disable or num_tokens <= 0:
+            return 0
+
+        num_evicted = 0
+        skipped_ids: set[int] = set()
+        while num_evicted < num_tokens:
+            candidates = sorted(
+                (
+                    node
+                    for node in self.evictable_full_host_leaves
+                    if node.id not in skipped_ids and node.host_ref_counter == 0
+                ),
+                key=lambda node: node.last_access_time,
+            )
+            x = self._select_ours_candidate(candidates, memory_kind="host_full")
+            if x is None:
+                break
+            evicted = self._evict_host_leaf(x)
+            if evicted <= 0:
+                skipped_ids.add(x.id)
+                continue
+            num_evicted += evicted
+            skipped_ids.clear()
+        return num_evicted
+
+    def evict_host(self, num_tokens: int):
+        if self.rrmc_radix_eviction_policy == "ours":
+            self._evict_host_full_ours(num_tokens)
+            return
+        return super().evict_host(num_tokens)
 
     def _evict_regular(self, node: TreeNode) -> tuple[int, int]:
         assert not node.evicted, f"already evicted, {node.id=}"

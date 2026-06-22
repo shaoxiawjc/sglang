@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -157,13 +158,25 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self.rrmc_segment_size = max(1, int(configured_segment_size))
         self._warned_page_size = False
         self._warned_bad_metadata = False
+        self._init_rrmc_eviction_policy(params, server_args)
         logger.info(
-            "Initialized RRMCMambaRadixCache with eviction policy: lru, segment_size=%s, admission=%s, admission_min_accesses=%s",
+            "Initialized RRMCMambaRadixCache with eviction policy: %s, "
+            "ours_alpha=%s, segment_size=%s, admission=%s, "
+            "admission_min_accesses=%s",
+            self.rrmc_radix_eviction_policy,
+            self.ours_evict_alpha,
             self.rrmc_segment_size,
             self.enable_rrmc_admission,
             self.rrmc_admission_min_accesses,
         )
         # self.disable = True
+
+    def _init_rrmc_eviction_policy(self, params, server_args) -> None:
+        self.rrmc_radix_eviction_policy = str(
+            getattr(server_args, "rrmc_radix_eviction_policy", "lru")
+        ).lower()
+        self.ours_evict_alpha = float(getattr(server_args, "ours_evict_alpha", 0.5))
+        self.rrmc_model_config = getattr(params, "model_config", None)
 
     def reset(self) -> None:
         super().reset()
@@ -206,6 +219,270 @@ class RRMCMambaRadixCache(MambaRadixCache):
         if node.mamba_value is not None:
             node.has_been_shared = True
             self.total_rrmc_accepted_state_hits += 1
+
+    def _collect_lru_stream_candidates(
+        self, lru_list, *, leaf_only: bool, excluded_ids: Optional[set[int]] = None
+    ) -> list[TreeNode]:
+        candidates: list[TreeNode] = []
+        excluded_ids = excluded_ids or set()
+        seen: set[int] = set()
+        x = (
+            lru_list.get_leaf_lru_no_lock()
+            if leaf_only
+            else lru_list.get_lru_no_lock()
+        )
+        while lru_list.in_list(x) and x.id not in seen:
+            seen.add(x.id)
+            if x.id not in excluded_ids:
+                candidates.append(x)
+            x = (
+                lru_list.get_prev_leaf_no_lock(x)
+                if leaf_only
+                else lru_list.get_prev_no_lock(x)
+            )
+        return candidates
+
+    def _rrmc_node_prefix_len(self, node: TreeNode) -> int:
+        prefix_tokens = getattr(node, "rrmc_prefix_tokens", None)
+        if prefix_tokens is not None:
+            return max(0, int(prefix_tokens))
+
+        total = 0
+        cur = node
+        while cur is not None and cur is not self.root_node:
+            key = getattr(cur, "key", None)
+            total += len(key) if key is not None else 0
+            cur = cur.parent
+        return max(0, total)
+
+    def _rrmc_hf_text_config(self):
+        model_config = getattr(self, "rrmc_model_config", None)
+        return getattr(model_config, "hf_text_config", model_config)
+
+    def _rrmc_hidden_size(self) -> float:
+        model_config = getattr(self, "rrmc_model_config", None)
+        hf_config = self._rrmc_hf_text_config()
+        hidden_size = getattr(model_config, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(hf_config, "hidden_size", 4096)
+        return max(1.0, float(hidden_size))
+
+    def _rrmc_num_attention_heads(self) -> float:
+        model_config = getattr(self, "rrmc_model_config", None)
+        if model_config is not None and hasattr(model_config, "get_num_attention_heads"):
+            try:
+                return max(1.0, float(model_config.get_num_attention_heads(1)))
+            except Exception:
+                pass
+        hf_config = self._rrmc_hf_text_config()
+        return max(1.0, float(getattr(hf_config, "num_attention_heads", 1)))
+
+    def _rrmc_num_layers(self) -> float:
+        model_config = getattr(self, "rrmc_model_config", None)
+        hf_config = self._rrmc_hf_text_config()
+        num_layers = getattr(model_config, "num_hidden_layers", None)
+        if num_layers is None:
+            num_layers = getattr(hf_config, "num_hidden_layers", None)
+        if num_layers is None:
+            num_layers = getattr(hf_config, "n_layer", 1)
+        return max(1.0, float(num_layers))
+
+    def _rrmc_num_mamba_layers(self) -> float:
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is not None and hasattr(mamba_pool, "num_mamba_layers"):
+            return max(0.0, float(mamba_pool.num_mamba_layers))
+        return 0.0
+
+    def _rrmc_num_attention_layers(self) -> Optional[float]:
+        model_config = getattr(self, "rrmc_model_config", None)
+        num_layers = getattr(model_config, "num_attention_layers", None)
+        if num_layers is None:
+            num_layers = getattr(self._rrmc_hf_text_config(), "num_attention_layers", None)
+        if num_layers is None:
+            return None
+        return max(0.0, float(num_layers))
+
+    def _rrmc_mlp_flops(self, prefix_len: int, hidden_size: float) -> float:
+        hf_config = self._rrmc_hf_text_config()
+        intermediate_size = getattr(hf_config, "intermediate_size", None)
+        if intermediate_size is None:
+            intermediate_size = getattr(hf_config, "ffn_hidden_size", None)
+        if intermediate_size is None:
+            return 16.0 * prefix_len * hidden_size * hidden_size
+        return 6.0 * prefix_len * hidden_size * float(intermediate_size)
+
+    def _rrmc_gdn_flops(self, prefix_len: int, hidden_size: float) -> float:
+        hf_config = self._rrmc_hf_text_config()
+        head_dim = float(
+            getattr(
+                hf_config,
+                "head_dim",
+                hidden_size / max(1.0, self._rrmc_num_attention_heads()),
+            )
+        )
+        dk = float(
+            getattr(hf_config, "mamba_d_state", getattr(hf_config, "state_size", head_dim))
+        )
+        dv = float(
+            getattr(
+                hf_config,
+                "mamba_d_inner",
+                getattr(hf_config, "intermediate_size", hidden_size),
+            )
+        )
+        hv = float(
+            getattr(
+                hf_config,
+                "num_mamba_heads",
+                getattr(hf_config, "num_attention_heads", self._rrmc_num_attention_heads()),
+            )
+        )
+        conv_len = float(
+            getattr(
+                hf_config,
+                "mamba_d_conv",
+                getattr(hf_config, "conv_kernel", getattr(hf_config, "linear_conv_kernel_dim", 1)),
+            )
+        )
+        c_core = 7.0
+        l = float(prefix_len)
+        d = hidden_size
+        return (
+            4.0 * l * d * (dk + dv + hv)
+            + 2.0 * l * conv_len * (2.0 * dk + dv)
+            + c_core * l * hv * dk * dv
+            + 2.0 * l * dv * d
+        )
+
+    def _rrmc_saved_flops(self, prefix_len: int) -> float:
+        if prefix_len <= 0:
+            return 0.0
+
+        hidden_size = self._rrmc_hidden_size()
+        l = float(prefix_len)
+        total_layers = self._rrmc_num_layers()
+        mamba_layers = min(total_layers, self._rrmc_num_mamba_layers())
+        attn_layers = self._rrmc_num_attention_layers()
+        if attn_layers is None:
+            attn_layers = max(0.0, total_layers - mamba_layers)
+            if mamba_layers == 0.0:
+                attn_layers = total_layers
+        mlp_layers = total_layers
+
+        attention_flops = 8.0 * l * hidden_size * hidden_size + 4.0 * l * l * hidden_size
+        return (
+            attn_layers * attention_flops
+            + mamba_layers * self._rrmc_gdn_flops(prefix_len, hidden_size)
+            + mlp_layers * self._rrmc_mlp_flops(prefix_len, hidden_size)
+        )
+
+    def _rrmc_kv_bytes_per_token(self, *, host: bool = False) -> float:
+        if host and hasattr(self, "full_kv_pool_host"):
+            return max(1.0, float(getattr(self.full_kv_pool_host, "size_per_token", 1)))
+
+        try:
+            kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            if hasattr(kv_pool, "full_kv_pool"):
+                kv_pool = kv_pool.full_kv_pool
+            total_bytes = kv_pool.get_kv_size_bytes()
+            if isinstance(total_bytes, tuple):
+                total_bytes = sum(total_bytes)
+            return max(1.0, float(total_bytes) / max(1, int(kv_pool.size)))
+        except Exception:
+            hidden_size = self._rrmc_hidden_size()
+            return max(1.0, 4.0 * hidden_size)
+
+    def _rrmc_mamba_bytes_per_slot(self, *, host: bool = False) -> float:
+        if host and hasattr(self, "mamba_pool_host"):
+            return max(1.0, float(getattr(self.mamba_pool_host, "size_per_token", 1)))
+
+        try:
+            mamba_pool = self.req_to_token_pool.mamba_pool
+            conv_total = 0
+            for conv_state in mamba_pool.mamba_cache.conv:
+                conv_total += math.prod(conv_state.shape[2:]) * conv_state.dtype.itemsize
+            temporal = (
+                math.prod(mamba_pool.mamba_cache.temporal.shape[2:])
+                * mamba_pool.mamba_cache.temporal.dtype.itemsize
+            )
+            return max(1.0, float(conv_total + temporal) * float(mamba_pool.num_mamba_layers))
+        except Exception:
+            hidden_size = self._rrmc_hidden_size()
+            return max(1.0, hidden_size * hidden_size * 2.0)
+
+    def _rrmc_candidate_memory_bytes(self, node: TreeNode, memory_kind: str) -> float:
+        memory_bytes = 0.0
+        is_host = memory_kind.startswith("host")
+        include_kv = memory_kind in {"full", "device_full", "host_full"}
+        include_mamba = memory_kind in {"mamba", "device_mamba", "host_mamba"}
+
+        if memory_kind in {"mamba", "device_mamba", "host_mamba"} and len(node.children) == 0:
+            include_kv = True
+
+        if include_kv:
+            if is_host:
+                if node.host_value is not None:
+                    memory_bytes += len(node.host_value) * self._rrmc_kv_bytes_per_token(host=True)
+            elif node.value is not None:
+                memory_bytes += len(node.value) * self._rrmc_kv_bytes_per_token(host=False)
+
+        if include_mamba or memory_kind in {"full", "device_full", "host_full"}:
+            if is_host:
+                if node.mamba_host_value is not None:
+                    memory_bytes += len(
+                        node.mamba_host_value
+                    ) * self._rrmc_mamba_bytes_per_slot(host=True)
+            elif node.mamba_value is not None:
+                memory_bytes += len(node.mamba_value) * self._rrmc_mamba_bytes_per_slot(host=False)
+
+        return max(1.0, memory_bytes)
+
+    def _select_ours_candidate(
+        self,
+        candidates: list[TreeNode],
+        *,
+        memory_kind: str,
+    ) -> Optional[TreeNode]:
+        if not candidates:
+            return None
+
+        raw_efficiencies = [
+            self._rrmc_saved_flops(self._rrmc_node_prefix_len(node))
+            / self._rrmc_candidate_memory_bytes(node, memory_kind)
+            for node in candidates
+        ]
+        eff_min = min(raw_efficiencies)
+        eff_max = max(raw_efficiencies)
+        denom = eff_max - eff_min
+        count = len(candidates)
+
+        best_node: Optional[TreeNode] = None
+        best_score = float("inf")
+        for rank, (node, raw_efficiency) in enumerate(zip(candidates, raw_efficiencies)):
+            recency_score = 1.0 if count == 1 else float(rank) / float(count - 1)
+            efficiency_score = (
+                1.0 if denom <= 0.0 else (raw_efficiency - eff_min) / denom
+            )
+            score = recency_score + self.ours_evict_alpha * efficiency_score
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "RRMC ours eviction candidate: kind=%s alpha=%.3f "
+                    "count=%s node=%s prefix_len=%s raw_eff=%.6e "
+                    "R=%.6f E=%.6f S=%.6f",
+                    memory_kind,
+                    self.ours_evict_alpha,
+                    count,
+                    node.id,
+                    self._rrmc_node_prefix_len(node),
+                    raw_efficiency,
+                    recency_score,
+                    efficiency_score,
+                    score,
+                )
+            if score < best_score:
+                best_score = score
+                best_node = node
+        return best_node
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         req = params.req
@@ -343,7 +620,10 @@ class RRMCMambaRadixCache(MambaRadixCache):
 
         before_blocks = self._count_cached_blocks()
         before_tokens, _ = self._total_size_helper()
-        result = super().evict(params)
+        if self.rrmc_radix_eviction_policy == "ours":
+            result = self._evict_ours(params)
+        else:
+            result = super().evict(params)
 
         after_blocks = self._count_cached_blocks()
         after_tokens, _ = self._total_size_helper()
@@ -358,6 +638,99 @@ class RRMCMambaRadixCache(MambaRadixCache):
             )
 
         return result
+
+    def _evict_ours(self, params: EvictParams) -> EvictResult:
+        full_num_evicted = 0
+        mamba_num_evicted = 0
+        self._ours_full_mamba_evicted = 0
+
+        if params.num_tokens > 0:
+            full_num_evicted = self._evict_full_ours(params.num_tokens)
+            mamba_num_evicted += self._ours_full_mamba_evicted
+        if params.mamba_num > 0:
+            mamba_num_evicted += self._evict_mamba_ours(params.mamba_num)
+        self._ours_full_mamba_evicted = 0
+
+        self._log_cache_stats(
+            evicted_tokens=full_num_evicted,
+            evicted_mamba_states=mamba_num_evicted,
+        )
+        return EvictResult(
+            num_tokens_evicted=full_num_evicted,
+            mamba_num_evicted=mamba_num_evicted,
+        )
+
+    def evict_full(self, full_num_tokens: int) -> int:
+        if self.rrmc_radix_eviction_policy == "ours":
+            return self._evict_full_ours(full_num_tokens)
+        return super().evict_full(full_num_tokens)
+
+    def evict_mamba(self, mamba_num: int) -> int:
+        if self.rrmc_radix_eviction_policy == "ours":
+            return self._evict_mamba_ours(mamba_num)
+        return super().evict_mamba(mamba_num)
+
+    def _evict_full_ours(self, full_num_tokens: int) -> int:
+        if self.disable or full_num_tokens <= 0:
+            return 0
+
+        full_num_evicted = 0
+        skipped_ids: set[int] = set()
+        while full_num_evicted < full_num_tokens:
+            candidates = self._collect_lru_stream_candidates(
+                self.full_lru_list, leaf_only=True, excluded_ids=skipped_ids
+            )
+            x = self._select_ours_candidate(candidates, memory_kind="full")
+            if x is None:
+                break
+            full_num_evicted_delta, mamba_num_evicted_delta, _, _ = (
+                self._evict_leaf_node(x, False)
+            )
+            if full_num_evicted_delta <= 0:
+                skipped_ids.add(x.id)
+                continue
+            full_num_evicted += full_num_evicted_delta
+            self._ours_full_mamba_evicted = (
+                getattr(self, "_ours_full_mamba_evicted", 0)
+                + mamba_num_evicted_delta
+            )
+            skipped_ids.clear()
+        return full_num_evicted
+
+    def _evict_mamba_ours(self, mamba_num: int) -> int:
+        if self.disable or mamba_num <= 0:
+            return 0
+
+        mamba_num_evicted = 0
+        skipped_ids: set[int] = set()
+        while mamba_num_evicted < mamba_num:
+            candidates = self._collect_lru_stream_candidates(
+                self.mamba_lru_list, leaf_only=False, excluded_ids=skipped_ids
+            )
+            x = self._select_ours_candidate(candidates, memory_kind="mamba")
+            if x is None:
+                break
+
+            assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
+            assert (
+                len(x.mamba_value) == 1
+            ), f"node has abnormal mamba length, {x.id=}, {len(x.mamba_value)=}"
+            assert x != self.root_node, f"root node is not evictable, {x.id=}"
+            assert x.mamba_lock_ref == 0, f"node is in use by mamba kv indices, {x.id=}"
+
+            if len(x.children) > 0:
+                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+                mamba_num_evicted += len(x.mamba_value)
+                self.mamba_lru_list.remove_node(x)
+                self._tombstone_internal_node(x)
+            else:
+                _, mamba_evicted_delta, _, _ = self._evict_leaf_node(x, True)
+                if mamba_evicted_delta <= 0:
+                    skipped_ids.add(x.id)
+                    continue
+                mamba_num_evicted += mamba_evicted_delta
+            skipped_ids.clear()
+        return mamba_num_evicted
 
     def _delete_leaf(self, node: TreeNode) -> None:
         assert node.mamba_value is not None, (

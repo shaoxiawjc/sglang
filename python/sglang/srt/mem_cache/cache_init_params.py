@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -20,6 +20,7 @@ class CacheInitParams:
     is_eagle: bool = False
     tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     eviction_policy: str = "lru"
+    model_config: Optional[Any] = None
     disable_finished_insert: bool = False
 
     enable_metrics: bool = False

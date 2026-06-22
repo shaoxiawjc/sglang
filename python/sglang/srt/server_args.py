@@ -174,7 +174,7 @@ NSA_CHOICES = [
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
-RRMC_RADIX_EVICTION_POLICY_CHOICES = ["lru"]
+RRMC_RADIX_EVICTION_POLICY_CHOICES = ["lru", "ours"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -359,6 +359,7 @@ class ServerArgs:
     radix_eviction_policy: str = "lru"
     enable_rrmc_radix_cache: bool = False
     rrmc_radix_eviction_policy: str = "lru"
+    ours_evict_alpha: float = 0.5
     enable_rrmc_admission: bool = False
     rrmc_admission_min_accesses: int = 2
     enable_prefill_delayer: bool = False
@@ -755,6 +756,9 @@ class ServerArgs:
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
 
+        # Validate RRMC eviction knobs early (before dummy-model short-circuit).
+        self._handle_rrmc_eviction_policy()
+
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
             return
@@ -908,6 +912,18 @@ class ServerArgs:
                 "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
                 "to be specified."
             )
+
+    def _handle_rrmc_eviction_policy(self):
+        self.rrmc_radix_eviction_policy = self.rrmc_radix_eviction_policy.lower()
+        self.ours_evict_alpha = float(self.ours_evict_alpha)
+        if self.rrmc_radix_eviction_policy not in RRMC_RADIX_EVICTION_POLICY_CHOICES:
+            raise ValueError(
+                f"Invalid rrmc_radix_eviction_policy: "
+                f"{self.rrmc_radix_eviction_policy!r}. Supported policies: "
+                f"{RRMC_RADIX_EVICTION_POLICY_CHOICES}."
+            )
+        if not (0.0 <= self.ours_evict_alpha <= 1.0):
+            raise ValueError("--ours-evict-alpha should be in range [0, 1].")
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -4022,7 +4038,13 @@ class ServerArgs:
             type=str,
             choices=RRMC_RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.rrmc_radix_eviction_policy,
-            help="Eviction policy for the RRMC block-aware radix cache. Only LRU is supported.",
+            help="Eviction policy for the RRMC block-aware radix cache.",
+        )
+        parser.add_argument(
+            "--ours-evict-alpha",
+            type=float,
+            default=ServerArgs.ours_evict_alpha,
+            help="Weight for the RRMC ours eviction compute-efficiency score. Must be in [0, 1].",
         )
         parser.add_argument(
             "--enable-rrmc-admission",
