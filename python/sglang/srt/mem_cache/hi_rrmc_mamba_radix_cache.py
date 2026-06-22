@@ -72,12 +72,6 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         if hasattr(self, "_rrmc_write_back_node_ids"):
             self._rrmc_write_back_node_ids.clear()
 
-    def sanity_check(self):
-        self.loading_check()
-        if self.ongoing_load_back or self.ongoing_write_through:
-            return
-        return RRMCMambaRadixCache.sanity_check(self)
-
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         req = params.req
         if self.disable or req is None:
@@ -493,7 +487,7 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         return sum(
             len(node.mamba_value)
             for node in self.mamba_lru_list.cache.values()
-            if self._is_mamba_device_evictable_node(node)
+            if node.mamba_value is not None and node.mamba_lock_ref == 0
         )
 
     def full_protected_size(self) -> int:
