@@ -470,12 +470,6 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
             and node in self.evictable_full_device_leaves
         )
 
-    def _is_mamba_device_evictable_node(self, node: TreeNode) -> bool:
-        return (
-            node.mamba_value is not None
-            and self._is_full_device_evictable_node(node)
-        )
-
     def full_evictable_size(self) -> int:
         return sum(
             len(node.value)
@@ -699,14 +693,17 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
             assert x.mamba_lock_ref == 0, f"node is in use, {x.id=}"
 
             x_next = self.mamba_lru_list.get_prev_no_lock(x)
-            if not self._is_full_device_evictable_node(x):
-                x = x_next
-                continue
-            evicted_full, evicted_mamba = self._evict_device_leaf(x)
-            if evicted_full <= 0 and evicted_mamba <= 0:
-                x = x_next
-                continue
-            mamba_num_evicted += evicted_mamba
+            if len(x.children) > 0:
+                mamba_num_evicted += self._free_device_mamba_for_node(x)
+            else:
+                if not self._is_full_device_evictable_node(x):
+                    x = x_next
+                    continue
+                evicted_full, evicted_mamba = self._evict_device_leaf(x)
+                if evicted_full <= 0 and evicted_mamba <= 0:
+                    x = x_next
+                    continue
+                mamba_num_evicted += evicted_mamba
 
             if not self.mamba_lru_list.in_list(x_next):
                 x_next = self.mamba_lru_list.get_lru_no_lock()
@@ -727,8 +724,11 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
                 continue
 
             if len(x.children) == 0 and x in self.evictable_full_host_leaves:
-                self._evict_host_leaf(x)
-                num_evicted += 1
+                if self._evict_host_leaf(x) > 0:
+                    num_evicted += 1
+            else:
+                if self._free_host_mamba_for_node(x) > 0:
+                    num_evicted += 1
 
             if not self.mamba_host_lru_list.in_list(x_next):
                 x_next = self.mamba_host_lru_list.get_lru_no_lock()
