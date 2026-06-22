@@ -717,6 +717,10 @@ class Scheduler(
         )
 
         # Create cache
+        cache_eviction_policy = server_args.radix_eviction_policy
+        if self.is_hybrid_ssm and server_args.enable_rrmc_radix_cache:
+            cache_eviction_policy = server_args.rrmc_radix_eviction_policy
+
         params = CacheInitParams(
             disable=server_args.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,
@@ -728,10 +732,11 @@ class Scheduler(
                 if self.server_args.enable_dp_attention
                 else self.tp_cpu_group
             ),
-            eviction_policy=server_args.radix_eviction_policy,
+            eviction_policy=cache_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
+            model_config=self.model_config,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             chunked_prefill_size=server_args.chunked_prefill_size,

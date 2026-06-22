@@ -6,6 +6,8 @@ from typing import Optional
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    EvictResult,
     InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
@@ -29,10 +31,13 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
 
     def __init__(self, params, server_args):
         self._rrmc_write_back_node_ids: set[int] = set()
+        self.ours_policy = None
         HiMambaRadixCache.__init__(self, params=params, server_args=server_args)
+        RRMCMambaRadixCache._init_ours_policy(self, params, server_args)
         self._init_rrmc_runtime_fields(server_args)
         logger.info(
-            "Initialized HiRRMCMambaRadixCache with segment_size=%s, admission=%s, admission_min_accesses=%s",
+            "Initialized HiRRMCMambaRadixCache with eviction policy: %s, segment_size=%s, admission=%s, admission_min_accesses=%s",
+            self.eviction_policy,
             self.rrmc_segment_size,
             self.enable_rrmc_admission,
             self.rrmc_admission_min_accesses,
@@ -111,6 +116,9 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
 
         if best_last_node is self.root_node:
             return self._empty_match_result()
+
+        if self.ours_policy is not None:
+            self.ours_policy.touch_path(best_last_node)
 
         if params.log_stats:
             self._log_rrmc_stats(
@@ -268,11 +276,18 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         node.host_value = host_indices
         if extra_pools:
             self.mamba_backup_commit(node, extra_pools)
+        if self.ours_policy is not None:
+            self.ours_policy.on_host_full_candidate_maybe_changed(node)
         assert len(node.host_value) > 0
         self.ongoing_write_through[node.id] = node
         if not write_back:
             self.inc_lock_ref(node)
         return len(host_indices)
+
+    def mamba_backup_commit(self, node: TreeNode, transfers) -> None:
+        HiMambaRadixCache.mamba_backup_commit(self, node, transfers)
+        if self.ours_policy is not None:
+            self.ours_policy.on_host_mamba_attached(node)
 
     def _finish_write_ack(self, ack_id) -> None:
         backuped_node = self.ongoing_write_through.pop(ack_id, None)
@@ -407,6 +422,8 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
                     )
                 else:
                     child.last_access_time = get_last_access_time()
+                    if self.ours_policy is not None:
+                        self.ours_policy.touch_node(child)
                     if child.evicted:
                         # Existing host-resident KV cannot be stitched into the
                         # current request's GPU prefix here. It must be restored
@@ -470,6 +487,30 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
             and node in self.evictable_full_device_leaves
         )
 
+    def _ours_is_full_candidate(self, node: TreeNode) -> bool:
+        return self._is_full_device_evictable_node(node)
+
+    def _ours_is_mamba_candidate(self, node: TreeNode) -> bool:
+        if node is self.root_node or node.mamba_value is None or node.mamba_lock_ref != 0:
+            return False
+        if node.evicted:
+            return False
+        if len(node.children) > 0:
+            return True
+        return self._is_full_device_evictable_node(node)
+
+    def _ours_is_host_full_candidate(self, node: TreeNode) -> bool:
+        return node in self.evictable_full_host_leaves
+
+    def _ours_is_host_mamba_candidate(self, node: TreeNode) -> bool:
+        if node is self.root_node or node.mamba_host_value is None:
+            return False
+        if getattr(node, "host_ref_counter", 0) != 0:
+            return False
+        if len(node.children) > 0:
+            return True
+        return node in self.evictable_full_host_leaves
+
     def full_evictable_size(self) -> int:
         return sum(
             len(node.value)
@@ -520,6 +561,9 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
             self.mamba_lru_list.remove_node(node)
         self._on_checkpoint_evicted(node)
         node.mamba_value = None
+        if self.ours_policy is not None:
+            self.ours_policy.on_mamba_detached(node)
+            self.ours_policy.on_full_candidate_maybe_changed(node)
         return mamba_num
 
     def _free_host_mamba_for_node(self, node: TreeNode) -> int:
@@ -530,6 +574,9 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         count = len(node.mamba_host_value)
         self.mamba_pool_host.free(node.mamba_host_value)
         node.mamba_host_value = None
+        if self.ours_policy is not None:
+            self.ours_policy.on_host_mamba_detached(node)
+            self.ours_policy.on_host_full_candidate_maybe_changed(node)
         return count
 
     def _backup_mamba_to_host(self, node: TreeNode) -> int:
@@ -596,6 +643,8 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         self._free_device_mamba_for_node(node)
         self._free_host_mamba_for_node(node)
         self._discard_from_leaf_sets(node)
+        if self.ours_policy is not None:
+            self.ours_policy.unregister_node(node)
         self._remove_rrmc_child_from_parent(node)
         self._update_leaf_status(node.parent)
         return True
@@ -638,14 +687,28 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
     def _update_full_host_leaf_status(self, node: TreeNode):
         if node.mamba_lock_ref > 0 or len(node.children) > 0:
             self.evictable_full_host_leaves.discard(node)
+            if self.ours_policy is not None:
+                self.ours_policy.on_host_full_candidate_maybe_changed(node)
+                self.ours_policy.on_host_mamba_candidate_maybe_changed(node)
             return
-        return super()._update_full_host_leaf_status(node)
+        ret = super()._update_full_host_leaf_status(node)
+        if self.ours_policy is not None:
+            self.ours_policy.on_host_full_candidate_maybe_changed(node)
+            self.ours_policy.on_host_mamba_candidate_maybe_changed(node)
+        return ret
 
     def _update_full_device_leaf_status(self, node: TreeNode):
         if node.mamba_lock_ref > 0:
             self.evictable_full_device_leaves.discard(node)
+            if self.ours_policy is not None:
+                self.ours_policy.on_full_candidate_maybe_changed(node)
+                self.ours_policy.on_mamba_candidate_maybe_changed(node)
             return
-        return super()._update_full_device_leaf_status(node)
+        ret = super()._update_full_device_leaf_status(node)
+        if self.ours_policy is not None:
+            self.ours_policy.on_full_candidate_maybe_changed(node)
+            self.ours_policy.on_mamba_candidate_maybe_changed(node)
+        return ret
 
     def _evict_device_leaf(self, node: TreeNode) -> tuple[int, int]:
         """Offload a device residency leaf, keeping KV and Mamba together."""
@@ -678,9 +741,94 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
 
         self._update_leaf_status(node)
         self._update_full_device_leaf_status(node.parent)
+        if self.ours_policy is not None:
+            self.ours_policy.on_full_candidate_maybe_changed(node)
+            self.ours_policy.on_mamba_candidate_maybe_changed(node)
+            self.ours_policy.on_host_full_candidate_maybe_changed(node)
+            self.ours_policy.on_host_mamba_candidate_maybe_changed(node)
         return num_full, mamba_num
 
+    def evict(self, params: EvictParams) -> EvictResult:
+        if self.eviction_policy != "ours":
+            return RRMCMambaRadixCache.evict(self, params)
+        if self.disable:
+            return EvictResult()
+
+        before_blocks = self._count_cached_blocks()
+        before_tokens, _ = self._total_size_helper()
+
+        full_num_evicted = 0
+        mamba_num_evicted = 0
+        if params.num_tokens > 0:
+            while full_num_evicted < params.num_tokens:
+                x = self.ours_policy.select_full_candidate()
+                if x is None:
+                    break
+                evicted_full, evicted_mamba = self._evict_device_leaf(x)
+                if evicted_full <= 0 and evicted_mamba <= 0:
+                    self.ours_policy.on_full_candidate_maybe_changed(x)
+                    break
+                full_num_evicted += evicted_full
+                mamba_num_evicted += evicted_mamba
+
+        if params.mamba_num > 0:
+            mamba_num_evicted += self.evict_mamba(params.mamba_num)
+
+        after_blocks = self._count_cached_blocks()
+        after_tokens, _ = self._total_size_helper()
+        evicted_blocks = max(0, before_blocks - after_blocks)
+        evicted_tokens = max(0, before_tokens - after_tokens)
+        if evicted_blocks > 0 or evicted_tokens > 0:
+            self._log_rrmc_stats(
+                hit_blocks=0,
+                hit_tokens=0,
+                evicted_blocks=evicted_blocks,
+                evicted_tokens=evicted_tokens,
+            )
+
+        return EvictResult(
+            num_tokens_evicted=full_num_evicted,
+            mamba_num_evicted=mamba_num_evicted,
+        )
+
+    def evict_host(self, num_tokens: int) -> int:
+        if self.eviction_policy != "ours":
+            return HiMambaRadixCache.evict_host(self, num_tokens)
+        if self.disable or num_tokens <= 0:
+            return 0
+
+        num_evicted = 0
+        while num_evicted < num_tokens:
+            x = self.ours_policy.select_host_full_candidate()
+            if x is None:
+                break
+            evicted = self._evict_host_leaf(x)
+            if evicted <= 0:
+                self.ours_policy.on_host_full_candidate_maybe_changed(x)
+                break
+            num_evicted += evicted
+        return num_evicted
+
     def evict_mamba(self, mamba_num: int) -> int:
+        if self.eviction_policy == "ours":
+            if self.disable or mamba_num <= 0:
+                return 0
+
+            mamba_num_evicted = 0
+            while mamba_num_evicted < mamba_num:
+                x = self.ours_policy.select_mamba_candidate()
+                if x is None:
+                    break
+                if len(x.children) > 0:
+                    evicted_mamba = self._free_device_mamba_for_node(x)
+                else:
+                    _, evicted_mamba = self._evict_device_leaf(x)
+                if evicted_mamba <= 0:
+                    self.ours_policy.on_mamba_candidate_maybe_changed(x)
+                    break
+                mamba_num_evicted += evicted_mamba
+            return mamba_num_evicted
+
         if self.disable or mamba_num <= 0:
             return 0
 
@@ -712,6 +860,27 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         return mamba_num_evicted
 
     def evict_mamba_host(self, num_mamba_hosts: int) -> int:
+        if self.eviction_policy == "ours":
+            if self.disable or num_mamba_hosts <= 0:
+                return 0
+
+            num_evicted = 0
+            while num_evicted < num_mamba_hosts:
+                x = self.ours_policy.select_host_mamba_candidate()
+                if x is None:
+                    break
+                if len(x.children) == 0 and x in self.evictable_full_host_leaves:
+                    evicted_mamba = 1 if self._evict_host_leaf(x) > 0 else 0
+                else:
+                    evicted_mamba = (
+                        1 if self._free_host_mamba_for_node(x) > 0 else 0
+                    )
+                if evicted_mamba <= 0:
+                    self.ours_policy.on_host_mamba_candidate_maybe_changed(x)
+                    break
+                num_evicted += evicted_mamba
+            return num_evicted
+
         if self.disable or num_mamba_hosts <= 0:
             return 0
 
@@ -752,6 +921,8 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
 
         node.value = None
         self._discard_from_leaf_sets(node)
+        if self.ours_policy is not None:
+            self.ours_policy.unregister_node(node)
         self._remove_rrmc_child_from_parent(node)
 
         parent = node.parent
@@ -780,6 +951,8 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         self._free_host_mamba_for_node(node)
 
         self._discard_from_leaf_sets(node)
+        if self.ours_policy is not None:
+            self.ours_policy.unregister_node(node)
         self._remove_rrmc_child_from_parent(node)
 
         parent = node.parent
@@ -794,6 +967,8 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
 
         self._discard_from_leaf_sets(node)
+        if self.ours_policy is not None:
+            self.ours_policy.unregister_node(node)
         if node.backuped and node.host_ref_counter == 0:
             self.cache_controller.evict_host(node.host_value)
             node.host_value = None

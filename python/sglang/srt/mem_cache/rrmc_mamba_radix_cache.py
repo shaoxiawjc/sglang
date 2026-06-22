@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.mamba_radix_cache import (
     get_last_access_time,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.rrmc_ours_eviction import RRMCOursEvictionPolicy
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
@@ -138,8 +139,10 @@ class RRMCMambaRadixCache(MambaRadixCache):
     """
 
     def __init__(self, params):
+        self.ours_policy = None
         super().__init__(params)
         server_args = get_global_server_args()
+        self._init_ours_policy(params, server_args)
         self.enable_rrmc_admission = bool(
             getattr(server_args, "enable_rrmc_admission", False)
         )
@@ -158,17 +161,32 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self._warned_page_size = False
         self._warned_bad_metadata = False
         logger.info(
-            "Initialized RRMCMambaRadixCache with eviction policy: lru, segment_size=%s, admission=%s, admission_min_accesses=%s",
+            "Initialized RRMCMambaRadixCache with eviction policy: %s, segment_size=%s, admission=%s, admission_min_accesses=%s",
+            self.eviction_policy,
             self.rrmc_segment_size,
             self.enable_rrmc_admission,
             self.rrmc_admission_min_accesses,
         )
         # self.disable = True
 
+    def _init_ours_policy(self, params, server_args) -> None:
+        self.eviction_policy = str(getattr(params, "eviction_policy", "lru")).lower()
+        if self.eviction_policy == "ours":
+            self.ours_policy = RRMCOursEvictionPolicy(
+                cache=self,
+                alpha=float(getattr(server_args, "ours_evict_alpha", 0.5)),
+                debug=bool(getattr(server_args, "ours_evict_debug", False)),
+                model_config=getattr(params, "model_config", None),
+            )
+        else:
+            self.ours_policy = None
+
     def reset(self) -> None:
         super().reset()
         if hasattr(self, "rrmc_admission_counts"):
             self.rrmc_admission_counts.clear()
+        if getattr(self, "ours_policy", None) is not None:
+            self.ours_policy.reset()
 
     def _reset_cache_perf_counters(self) -> None:
         super()._reset_cache_perf_counters()
@@ -239,6 +257,9 @@ class RRMCMambaRadixCache(MambaRadixCache):
 
         if best_value_len == 0:
             return self._empty_match_result()
+
+        if self.ours_policy is not None:
+            self.ours_policy.touch_path(best_last_node)
 
         if params.log_stats:
             self._log_rrmc_stats(
@@ -359,11 +380,72 @@ class RRMCMambaRadixCache(MambaRadixCache):
 
         return result
 
+    def _ours_is_full_candidate(self, node: TreeNode) -> bool:
+        return (
+            node is not self.root_node
+            and node.value is not None
+            and len(node.children) == 0
+            and node.full_lock_ref == 0
+            and node.mamba_lock_ref == 0
+        )
+
+    def _ours_is_mamba_candidate(self, node: TreeNode) -> bool:
+        if node is self.root_node or node.mamba_value is None or node.mamba_lock_ref != 0:
+            return False
+        if len(node.children) > 0:
+            return True
+        return node.value is not None and node.full_lock_ref == 0
+
+    def evict_full(self, full_num_tokens: int) -> int:
+        if self.eviction_policy != "ours":
+            return super().evict_full(full_num_tokens)
+        if self.disable or full_num_tokens <= 0:
+            return 0
+
+        full_num_evicted = 0
+        while full_num_evicted < full_num_tokens:
+            x = self.ours_policy.select_full_candidate()
+            if x is None:
+                break
+            full_num_evicted_delta, _, _, _ = self._evict_leaf_node(x, False)
+            if full_num_evicted_delta <= 0:
+                self.ours_policy.on_full_candidate_maybe_changed(x)
+                break
+            full_num_evicted += full_num_evicted_delta
+        return full_num_evicted
+
+    def evict_mamba(self, mamba_num: int) -> int:
+        if self.eviction_policy != "ours":
+            return super().evict_mamba(mamba_num)
+        if self.disable or mamba_num <= 0:
+            return 0
+
+        mamba_num_evicted = 0
+        while mamba_num_evicted < mamba_num:
+            x = self.ours_policy.select_mamba_candidate()
+            if x is None:
+                break
+            if len(x.children) > 0:
+                mamba_num_evicted_delta = len(x.mamba_value)
+                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+                if self.mamba_lru_list.in_list(x):
+                    self.mamba_lru_list.remove_node(x)
+                self._tombstone_internal_node(x)
+            else:
+                _, mamba_num_evicted_delta, _, _ = self._evict_leaf_node(x, True)
+            if mamba_num_evicted_delta <= 0:
+                self.ours_policy.on_mamba_candidate_maybe_changed(x)
+                break
+            mamba_num_evicted += mamba_num_evicted_delta
+        return mamba_num_evicted
+
     def _delete_leaf(self, node: TreeNode) -> None:
         assert node.mamba_value is not None, (
             f"Invariant violated: RRMC leaf node must carry mamba, {node.id=}"
         )
         assert len(node.children) == 0, f"RRMC leaf node has children, {node.id=}"
+        if self.ours_policy is not None:
+            self.ours_policy.unregister_node(node)
         key = self._node_tree_key(node)
         v = node.parent.children.pop(key, None)
         assert v == node, f"Parent does not have RRMC child key, {key}"
@@ -377,11 +459,19 @@ class RRMCMambaRadixCache(MambaRadixCache):
             f"Deleting unexpected non-tombstone RRMC leaf node, {node.id=}"
         )
         assert len(node.children) == 0, f"RRMC leaf node has children, {node.id=}"
+        if self.ours_policy is not None:
+            self.ours_policy.unregister_node(node)
         key = self._node_tree_key(node)
         v = node.parent.children.pop(key, None)
         assert v == node, f"Parent does not have RRMC child key, {key}"
         self._on_token_node_evicted(node)
         self.full_evictable_size_ -= len(node.key)
+
+    def _tombstone_internal_node(self, node: TreeNode) -> None:
+        super()._tombstone_internal_node(node)
+        if self.ours_policy is not None:
+            self.ours_policy.on_mamba_detached(node)
+            self.ours_policy.on_full_candidate_maybe_changed(node)
 
     def _evict_leaf_node(
         self, x: TreeNode, is_evict_mamba: bool
@@ -846,6 +936,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self.full_lru_list.insert_mru(node)
         self.full_evictable_size_ += len(node.value)
         self._on_token_node_created(node)
+        if self.ours_policy is not None:
+            self.ours_policy.register_node(node)
         return node
 
     def _ensure_mamba_on_node(
@@ -866,6 +958,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self.mamba_lru_list.insert_mru(node)
         self.mamba_evictable_size_ += len(node.mamba_value)
         self._on_checkpoint_created(node)
+        if self.ours_policy is not None:
+            self.ours_policy.on_mamba_attached(node)
         self._mark_rrmc_boundary_slot_attached(
             req, int(getattr(node, "rrmc_prefix_tokens", 0))
         )
@@ -917,6 +1011,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 )
             else:
                 child.last_access_time = get_last_access_time()
+                if self.ours_policy is not None:
+                    self.ours_policy.touch_node(child)
                 self.full_lru_list.reset_node_mru(child)
                 if child.mamba_value is not None:
                     self.mamba_lru_list.reset_node_mru(child)

@@ -174,7 +174,7 @@ NSA_CHOICES = [
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
-RRMC_RADIX_EVICTION_POLICY_CHOICES = ["lru"]
+RRMC_RADIX_EVICTION_POLICY_CHOICES = ["lru", "ours"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -359,6 +359,8 @@ class ServerArgs:
     radix_eviction_policy: str = "lru"
     enable_rrmc_radix_cache: bool = False
     rrmc_radix_eviction_policy: str = "lru"
+    ours_evict_alpha: float = 0.5
+    ours_evict_debug: bool = False
     enable_rrmc_admission: bool = False
     rrmc_admission_min_accesses: int = 2
     enable_prefill_delayer: bool = False
@@ -4022,7 +4024,18 @@ class ServerArgs:
             type=str,
             choices=RRMC_RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.rrmc_radix_eviction_policy,
-            help="Eviction policy for the RRMC block-aware radix cache. Only LRU is supported.",
+            help="Eviction policy for the RRMC block-aware radix cache.",
+        )
+        parser.add_argument(
+            "--ours-evict-alpha",
+            type=float,
+            default=ServerArgs.ours_evict_alpha,
+            help="Alpha for the RRMC ours eviction policy. Must be in [0, 1].",
+        )
+        parser.add_argument(
+            "--ours-evict-debug",
+            action="store_true",
+            help="Enable debug logging for the RRMC ours eviction policy.",
         )
         parser.add_argument(
             "--enable-rrmc-admission",
@@ -6180,6 +6193,9 @@ class ServerArgs:
         assert (
             self.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"
+
+        if not 0 <= self.ours_evict_alpha <= 1:
+            raise ValueError("--ours-evict-alpha must be in [0, 1].")
 
         if self.model_impl == "mindspore":
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -26,6 +26,8 @@ class CacheInitParams:
     enable_kv_cache_events: bool = False
 
     enable_mamba_extra_buffer: bool = False
+
+    model_config: Optional[Any] = None
 
     pp_rank: int = 0
     pp_size: int = 1
