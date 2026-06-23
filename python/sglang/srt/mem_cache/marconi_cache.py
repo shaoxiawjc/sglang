@@ -469,7 +469,7 @@ class MarconiCache(MambaRadixCache):
 
         last_mamba_node = self._nearest_mamba_node(node)
         if last_mamba_node is None:
-            return req.cache_protected_len, self.root_node
+            return int(getattr(node, "marconi_prefix_tokens", 0)), node
         return int(getattr(last_mamba_node, "marconi_prefix_tokens", 0)), last_mamba_node
 
     def _insert_kv_only(
