@@ -358,6 +358,7 @@ class ServerArgs:
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_rrmc_radix_cache: bool = False
+    enable_marconi_cache: bool = False
     rrmc_radix_eviction_policy: str = "lru"
     ours_evict_alpha: float = 0.5
     enable_rrmc_admission: bool = False
@@ -914,6 +915,10 @@ class ServerArgs:
             )
 
     def _handle_rrmc_eviction_policy(self):
+        if self.enable_rrmc_radix_cache and self.enable_marconi_cache:
+            raise ValueError(
+                "--enable-rrmc-radix-cache and --enable-marconi-cache are mutually exclusive."
+            )
         self.rrmc_radix_eviction_policy = self.rrmc_radix_eviction_policy.lower()
         self.ours_evict_alpha = float(self.ours_evict_alpha)
         if self.rrmc_radix_eviction_policy not in RRMC_RADIX_EVICTION_POLICY_CHOICES:
@@ -4032,6 +4037,11 @@ class ServerArgs:
             "--enable-rrmc-radix-cache",
             action="store_true",
             help="Enable the RRMC block-aware radix cache for hybrid SSM models.",
+        )
+        parser.add_argument(
+            "--enable-marconi-cache",
+            action="store_true",
+            help="Enable the input-only Marconi-style radix cache for hybrid SSM models.",
         )
         parser.add_argument(
             "--rrmc-radix-eviction-policy",

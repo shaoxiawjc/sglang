@@ -796,6 +796,10 @@ class Scheduler(
                     )
 
                     self.tree_cache = RRMCMambaRadixCache(params)
+                elif server_args.enable_marconi_cache:
+                    from sglang.srt.mem_cache.marconi_cache import MarconiCache
+
+                    self.tree_cache = MarconiCache(params)
                 else:
                     from sglang.srt.mem_cache.mamba_radix_cache import (
                         MambaRadixCache,
