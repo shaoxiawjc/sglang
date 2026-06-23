@@ -617,7 +617,11 @@ class MarconiCache(MambaRadixCache):
         node.last_access_time = get_last_access_time()
         self.full_lru_list.reset_node_mru(node)
         self.mamba_lru_list.insert_mru(node)
-        self.mamba_evictable_size_ += len(node.mamba_value)
+        if node.full_lock_ref > 0:
+            self.mamba_protected_size_ += len(node.mamba_value)
+            node.mamba_lock_ref += 1
+        else:
+            self.mamba_evictable_size_ += len(node.mamba_value)
         self._on_checkpoint_created(node)
         return True
 
