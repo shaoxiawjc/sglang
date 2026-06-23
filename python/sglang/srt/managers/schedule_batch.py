@@ -1596,8 +1596,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.rrmc_boundaries_by_req = None
 
         prepare_rrmc_boundaries = getattr(
-            self.tree_cache, "prepare_rrmc_forward_boundaries", None
+            self.tree_cache, "prepare_mamba_forward_boundaries", None
         )
+        if not callable(prepare_rrmc_boundaries):
+            prepare_rrmc_boundaries = getattr(
+                self.tree_cache, "prepare_rrmc_forward_boundaries", None
+            )
         if callable(prepare_rrmc_boundaries):
             rrmc_boundaries = prepare_rrmc_boundaries(reqs, prefix_lens, extend_lens)
             if rrmc_boundaries is not None and rrmc_boundaries.boundaries:
@@ -1844,8 +1848,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return i + 1
 
         disable_rrmc_tracking_fn = getattr(
-            self.tree_cache, "rrmc_disable_operator_chunk_state_tracking", None
+            self.tree_cache, "disable_operator_chunk_state_tracking", None
         )
+        if not callable(disable_rrmc_tracking_fn):
+            disable_rrmc_tracking_fn = getattr(
+                self.tree_cache, "rrmc_disable_operator_chunk_state_tracking", None
+            )
         if (
             callable(disable_rrmc_tracking_fn)
             and disable_rrmc_tracking_fn(req)
