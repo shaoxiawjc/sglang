@@ -132,12 +132,13 @@ class MarconiCache(MambaRadixCache):
             cached_len = req.cache_protected_len
             new_last_node = req.last_node
             if is_insert and input_len > 0:
-                cached_len, new_last_node = self._cache_input_kv_path(
+                _cached_len, new_last_node = self._cache_input_kv_path(
                     req=req,
                     token_ids=req.origin_input_ids[:input_len],
                     kv_indices=kv_indices[:input_len],
                     duplicate_free_from=req.cache_protected_len,
                 )
+                cached_len = max(cached_len, _cached_len)
 
             mamba_attached = self._attach_mamba_to_node(new_last_node, req)
 
