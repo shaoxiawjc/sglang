@@ -139,8 +139,11 @@ class MarconiCache(MambaRadixCache):
                     duplicate_free_from=req.cache_protected_len,
                 )
 
+            mamba_attached = self._attach_mamba_to_node(new_last_node, req)
+
             self._free_req_kv(req, max(cached_len, input_len), kv_committed_len)
-            self._free_finished_req_mamba(req)
+            if not mamba_attached:
+                self._free_finished_req_mamba(req)
             self.dec_lock_ref(req.last_node)
             req.last_node = new_last_node
         finally:
@@ -602,6 +605,20 @@ class MarconiCache(MambaRadixCache):
         self._on_checkpoint_created(node)
         self._mark_marconi_boundary_slot_attached(req, prefix_len)
         self.total_marconi_created_states += 1
+        return True
+
+    def _attach_mamba_to_node(self, node: TreeNode, req) -> bool:
+        if node is self.root_node or node.mamba_value is not None:
+            return False
+        if req.mamba_pool_idx is None:
+            return False
+
+        node.mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+        node.last_access_time = get_last_access_time()
+        self.full_lru_list.reset_node_mru(node)
+        self.mamba_lru_list.insert_mru(node)
+        self.mamba_evictable_size_ += len(node.mamba_value)
+        self._on_checkpoint_created(node)
         return True
 
     def _consume_marconi_boundary_slot(self, req, prefix_len: int) -> Optional[torch.Tensor]:
