@@ -463,7 +463,9 @@ class MarconiCache(MambaRadixCache):
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
         self._on_token_node_evicted(node)
-        self.full_evictable_size_ -= len(node.key)
+        # Keep the tree-side evictable counter aligned with the allocator-side
+        # KV pages that are actually freed by the eviction path.
+        self.full_evictable_size_ -= len(node.value)
         if node.mamba_value is not None:
             self.mamba_evictable_size_ -= len(node.mamba_value)
 
