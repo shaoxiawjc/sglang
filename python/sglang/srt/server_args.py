@@ -174,7 +174,7 @@ NSA_CHOICES = [
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
-RRMC_RADIX_EVICTION_POLICY_CHOICES = ["lru", "ours"]
+RRMC_RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "depth_aware", "ours"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -361,6 +361,7 @@ class ServerArgs:
     enable_marconi_cache: bool = False
     rrmc_radix_eviction_policy: str = "lru"
     ours_evict_alpha: float = 0.5
+    depth_aware_evict_lambda: float = 0.5
     enable_rrmc_admission: bool = False
     rrmc_admission_min_accesses: int = 2
     enable_prefill_delayer: bool = False
@@ -921,6 +922,7 @@ class ServerArgs:
             )
         self.rrmc_radix_eviction_policy = self.rrmc_radix_eviction_policy.lower()
         self.ours_evict_alpha = float(self.ours_evict_alpha)
+        self.depth_aware_evict_lambda = float(self.depth_aware_evict_lambda)
         if self.rrmc_radix_eviction_policy not in RRMC_RADIX_EVICTION_POLICY_CHOICES:
             raise ValueError(
                 f"Invalid rrmc_radix_eviction_policy: "
@@ -929,6 +931,8 @@ class ServerArgs:
             )
         if not (0.0 <= self.ours_evict_alpha <= 1.0):
             raise ValueError("--ours-evict-alpha should be in range [0, 1].")
+        if self.depth_aware_evict_lambda < 0.0:
+            raise ValueError("--depth-aware-evict-lambda should be non-negative.")
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -4055,6 +4059,15 @@ class ServerArgs:
             type=float,
             default=ServerArgs.ours_evict_alpha,
             help="Weight for the RRMC ours eviction compute-efficiency score. Must be in [0, 1].",
+        )
+        parser.add_argument(
+            "--depth-aware-evict-lambda",
+            type=float,
+            default=ServerArgs.depth_aware_evict_lambda,
+            help=(
+                "Depth penalty weight for RRMC depth-aware eviction. "
+                "Must be non-negative."
+            ),
         )
         parser.add_argument(
             "--enable-rrmc-admission",

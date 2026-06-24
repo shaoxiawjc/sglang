@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+RRMC_RANKED_EVICTION_POLICIES = {"lfu", "depth_aware", "ours"}
+
 ANSI_RESET = "\x1b[0m"
 ANSI_CYAN = "\x1b[36m"
 ANSI_GREEN = "\x1b[32m"
@@ -161,10 +163,11 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self._init_rrmc_eviction_policy(params, server_args)
         logger.info(
             "Initialized RRMCMambaRadixCache with eviction policy: %s, "
-            "ours_alpha=%s, segment_size=%s, admission=%s, "
+            "ours_alpha=%s, depth_lambda=%s, segment_size=%s, admission=%s, "
             "admission_min_accesses=%s",
             self.rrmc_radix_eviction_policy,
             self.ours_evict_alpha,
+            self.depth_aware_evict_lambda,
             self.rrmc_segment_size,
             self.enable_rrmc_admission,
             self.rrmc_admission_min_accesses,
@@ -176,6 +179,9 @@ class RRMCMambaRadixCache(MambaRadixCache):
             getattr(server_args, "rrmc_radix_eviction_policy", "lru")
         ).lower()
         self.ours_evict_alpha = float(getattr(server_args, "ours_evict_alpha", 0.5))
+        self.depth_aware_evict_lambda = float(
+            getattr(server_args, "depth_aware_evict_lambda", 0.5)
+        )
         self.rrmc_model_config = getattr(params, "model_config", None)
 
     def reset(self) -> None:
@@ -254,6 +260,24 @@ class RRMCMambaRadixCache(MambaRadixCache):
             total += len(key) if key is not None else 0
             cur = cur.parent
         return max(0, total)
+
+    @staticmethod
+    def _ensure_rrmc_eviction_fields(node: TreeNode) -> None:
+        if not hasattr(node, "rrmc_access_count"):
+            node.rrmc_access_count = 0
+
+    def _record_rrmc_path_access(self, nodes: list[TreeNode]) -> None:
+        for node in nodes:
+            self._ensure_rrmc_eviction_fields(node)
+            node.rrmc_access_count += 1
+
+    def _rrmc_node_depth(self, node: TreeNode) -> int:
+        depth = 0
+        current = node
+        while current is not None and current is not self.root_node:
+            depth += 1
+            current = current.parent
+        return depth
 
     def _rrmc_hf_text_config(self):
         model_config = getattr(self, "rrmc_model_config", None)
@@ -484,6 +508,80 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 best_node = node
         return best_node
 
+    def _select_lfu_candidate(
+        self, candidates: list[TreeNode]
+    ) -> Optional[TreeNode]:
+        if not candidates:
+            return None
+        for node in candidates:
+            self._ensure_rrmc_eviction_fields(node)
+        return min(
+            candidates,
+            key=lambda node: (
+                node.rrmc_access_count,
+                node.last_access_time,
+                node.id,
+            ),
+        )
+
+    def _select_depth_aware_candidate(
+        self, candidates: list[TreeNode]
+    ) -> Optional[TreeNode]:
+        if not candidates:
+            return None
+
+        ordered = sorted(candidates, key=lambda node: (node.last_access_time, node.id))
+        depths = {node.id: self._rrmc_node_depth(node) for node in ordered}
+        depth_max = max(depths.values(), default=0)
+        recency_denom = max(1, len(ordered) - 1)
+
+        best_node: Optional[TreeNode] = None
+        best_key: Optional[tuple[float, float, int]] = None
+        for rank, node in enumerate(ordered):
+            recency_score = (
+                0.0 if len(ordered) == 1 else float(rank) / float(recency_denom)
+            )
+            normalized_depth = (
+                0.0 if depth_max == 0 else float(depths[node.id]) / float(depth_max)
+            )
+            score = (
+                recency_score
+                - self.depth_aware_evict_lambda * normalized_depth
+            )
+            key = (score, node.last_access_time, node.id)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "RRMC depth-aware eviction candidate: lambda=%.3f "
+                    "node=%s depth=%s depth_max=%s R=%.6f S=%.6f",
+                    self.depth_aware_evict_lambda,
+                    node.id,
+                    depths[node.id],
+                    depth_max,
+                    recency_score,
+                    score,
+                )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_node = node
+        return best_node
+
+    def _select_ranked_candidate(
+        self,
+        candidates: list[TreeNode],
+        *,
+        memory_kind: str,
+    ) -> Optional[TreeNode]:
+        if self.rrmc_radix_eviction_policy == "ours":
+            return self._select_ours_candidate(candidates, memory_kind=memory_kind)
+        if self.rrmc_radix_eviction_policy == "lfu":
+            return self._select_lfu_candidate(candidates)
+        if self.rrmc_radix_eviction_policy == "depth_aware":
+            return self._select_depth_aware_candidate(candidates)
+        raise ValueError(
+            f"Unsupported ranked RRMC eviction policy: "
+            f"{self.rrmc_radix_eviction_policy!r}"
+        )
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         req = params.req
         if self.disable or req is None:
@@ -516,6 +614,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
 
         if best_value_len == 0:
             return self._empty_match_result()
+
+        self._record_rrmc_path_access(matched_nodes[:best_value_len])
 
         if params.log_stats:
             self._log_rrmc_stats(
@@ -620,8 +720,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
 
         before_blocks = self._count_cached_blocks()
         before_tokens, _ = self._total_size_helper()
-        if self.rrmc_radix_eviction_policy == "ours":
-            result = self._evict_ours(params)
+        if self.rrmc_radix_eviction_policy in RRMC_RANKED_EVICTION_POLICIES:
+            result = self._evict_ranked(params)
         else:
             result = super().evict(params)
 
@@ -639,17 +739,17 @@ class RRMCMambaRadixCache(MambaRadixCache):
 
         return result
 
-    def _evict_ours(self, params: EvictParams) -> EvictResult:
+    def _evict_ranked(self, params: EvictParams) -> EvictResult:
         full_num_evicted = 0
         mamba_num_evicted = 0
-        self._ours_full_mamba_evicted = 0
+        self._ranked_full_mamba_evicted = 0
 
         if params.num_tokens > 0:
-            full_num_evicted = self._evict_full_ours(params.num_tokens)
-            mamba_num_evicted += self._ours_full_mamba_evicted
+            full_num_evicted = self._evict_full_ranked(params.num_tokens)
+            mamba_num_evicted += self._ranked_full_mamba_evicted
         if params.mamba_num > 0:
-            mamba_num_evicted += self._evict_mamba_ours(params.mamba_num)
-        self._ours_full_mamba_evicted = 0
+            mamba_num_evicted += self._evict_mamba_ranked(params.mamba_num)
+        self._ranked_full_mamba_evicted = 0
 
         self._log_cache_stats(
             evicted_tokens=full_num_evicted,
@@ -661,16 +761,16 @@ class RRMCMambaRadixCache(MambaRadixCache):
         )
 
     def evict_full(self, full_num_tokens: int) -> int:
-        if self.rrmc_radix_eviction_policy == "ours":
-            return self._evict_full_ours(full_num_tokens)
+        if self.rrmc_radix_eviction_policy in RRMC_RANKED_EVICTION_POLICIES:
+            return self._evict_full_ranked(full_num_tokens)
         return super().evict_full(full_num_tokens)
 
     def evict_mamba(self, mamba_num: int) -> int:
-        if self.rrmc_radix_eviction_policy == "ours":
-            return self._evict_mamba_ours(mamba_num)
+        if self.rrmc_radix_eviction_policy in RRMC_RANKED_EVICTION_POLICIES:
+            return self._evict_mamba_ranked(mamba_num)
         return super().evict_mamba(mamba_num)
 
-    def _evict_full_ours(self, full_num_tokens: int) -> int:
+    def _evict_full_ranked(self, full_num_tokens: int) -> int:
         if self.disable or full_num_tokens <= 0:
             return 0
 
@@ -680,7 +780,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
             candidates = self._collect_lru_stream_candidates(
                 self.full_lru_list, leaf_only=True, excluded_ids=skipped_ids
             )
-            x = self._select_ours_candidate(candidates, memory_kind="full")
+            x = self._select_ranked_candidate(candidates, memory_kind="full")
             if x is None:
                 break
             full_num_evicted_delta, mamba_num_evicted_delta, _, _ = (
@@ -690,14 +790,14 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 skipped_ids.add(x.id)
                 continue
             full_num_evicted += full_num_evicted_delta
-            self._ours_full_mamba_evicted = (
-                getattr(self, "_ours_full_mamba_evicted", 0)
+            self._ranked_full_mamba_evicted = (
+                getattr(self, "_ranked_full_mamba_evicted", 0)
                 + mamba_num_evicted_delta
             )
             skipped_ids.clear()
         return full_num_evicted
 
-    def _evict_mamba_ours(self, mamba_num: int) -> int:
+    def _evict_mamba_ranked(self, mamba_num: int) -> int:
         if self.disable or mamba_num <= 0:
             return 0
 
@@ -707,7 +807,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
             candidates = self._collect_lru_stream_candidates(
                 self.mamba_lru_list, leaf_only=False, excluded_ids=skipped_ids
             )
-            x = self._select_ours_candidate(candidates, memory_kind="mamba")
+            x = self._select_ranked_candidate(candidates, memory_kind="mamba")
             if x is None:
                 break
 
@@ -1215,6 +1315,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         node.rrmc_total_block_tokens = segment.block_token_count
         node.rrmc_is_block_end = segment.is_block_end
         node.rrmc_prefix_tokens = segment.end
+        node.rrmc_access_count = 1
         parent.children[tree_key] = node
         self.full_lru_list.insert_mru(node)
         self.full_evictable_size_ += len(node.value)

@@ -13,7 +13,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode, get_last_access_time
 from sglang.srt.mem_cache.radix_cache import compute_node_hash_values
-from sglang.srt.mem_cache.rrmc_mamba_radix_cache import RRMCMambaRadixCache
+from sglang.srt.mem_cache.rrmc_mamba_radix_cache import (
+    RRMC_RANKED_EVICTION_POLICIES,
+    RRMCMambaRadixCache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +37,11 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         self._init_rrmc_eviction_policy(params, server_args)
         logger.info(
             "Initialized HiRRMCMambaRadixCache with eviction policy=%s, "
-            "ours_alpha=%s, segment_size=%s, admission=%s, "
+            "ours_alpha=%s, depth_lambda=%s, segment_size=%s, admission=%s, "
             "admission_min_accesses=%s",
             self.rrmc_radix_eviction_policy,
             self.ours_evict_alpha,
+            self.depth_aware_evict_lambda,
             self.rrmc_segment_size,
             self.enable_rrmc_admission,
             self.rrmc_admission_min_accesses,
@@ -116,6 +120,9 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
 
         if best_last_node is self.root_node:
             return self._empty_match_result()
+
+        best_node_index = matched_nodes.index(best_last_node)
+        self._record_rrmc_path_access(matched_nodes[: best_node_index + 1])
 
         if params.log_stats:
             self._log_rrmc_stats(
@@ -685,7 +692,7 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         self._update_full_device_leaf_status(node.parent)
         return num_full, mamba_num
 
-    def _evict_full_ours(self, full_num_tokens: int) -> int:
+    def _evict_full_ranked(self, full_num_tokens: int) -> int:
         if self.disable or full_num_tokens <= 0:
             return 0
 
@@ -701,7 +708,9 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
                 ),
                 key=lambda node: node.last_access_time,
             )
-            x = self._select_ours_candidate(candidates, memory_kind="device_full")
+            x = self._select_ranked_candidate(
+                candidates, memory_kind="device_full"
+            )
             if x is None:
                 break
 
@@ -710,14 +719,14 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
                 skipped_ids.add(x.id)
                 continue
             full_num_evicted += evicted_full
-            self._ours_full_mamba_evicted = (
-                getattr(self, "_ours_full_mamba_evicted", 0) + evicted_mamba
+            self._ranked_full_mamba_evicted = (
+                getattr(self, "_ranked_full_mamba_evicted", 0) + evicted_mamba
             )
             skipped_ids.clear()
 
         return full_num_evicted
 
-    def _evict_mamba_ours(self, mamba_num: int) -> int:
+    def _evict_mamba_ranked(self, mamba_num: int) -> int:
         if self.disable or mamba_num <= 0:
             return 0
 
@@ -733,7 +742,9 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
                 )
                 if len(node.children) > 0 or self._is_full_device_evictable_node(node)
             ]
-            x = self._select_ours_candidate(candidates, memory_kind="device_mamba")
+            x = self._select_ranked_candidate(
+                candidates, memory_kind="device_mamba"
+            )
             if x is None:
                 break
 
@@ -753,8 +764,8 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         return mamba_num_evicted
 
     def evict_mamba(self, mamba_num: int) -> int:
-        if self.rrmc_radix_eviction_policy == "ours":
-            return self._evict_mamba_ours(mamba_num)
+        if self.rrmc_radix_eviction_policy in RRMC_RANKED_EVICTION_POLICIES:
+            return self._evict_mamba_ranked(mamba_num)
         if self.disable or mamba_num <= 0:
             return 0
 
@@ -785,7 +796,7 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
 
         return mamba_num_evicted
 
-    def _evict_mamba_host_ours(self, num_mamba_hosts: int) -> int:
+    def _evict_mamba_host_ranked(self, num_mamba_hosts: int) -> int:
         if self.disable or num_mamba_hosts <= 0:
             return 0
 
@@ -801,7 +812,7 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
                 )
                 if node.host_ref_counter == 0
             ]
-            x = self._select_ours_candidate(candidates, memory_kind="host_mamba")
+            x = self._select_ranked_candidate(candidates, memory_kind="host_mamba")
             if x is None:
                 break
 
@@ -820,8 +831,8 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         return num_evicted
 
     def evict_mamba_host(self, num_mamba_hosts: int) -> int:
-        if self.rrmc_radix_eviction_policy == "ours":
-            return self._evict_mamba_host_ours(num_mamba_hosts)
+        if self.rrmc_radix_eviction_policy in RRMC_RANKED_EVICTION_POLICIES:
+            return self._evict_mamba_host_ranked(num_mamba_hosts)
         if self.disable or num_mamba_hosts <= 0:
             return 0
 
@@ -845,7 +856,7 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
             x = x_next
         return num_evicted
 
-    def _evict_host_full_ours(self, num_tokens: int) -> int:
+    def _evict_host_full_ranked(self, num_tokens: int) -> int:
         if self.disable or num_tokens <= 0:
             return 0
 
@@ -860,7 +871,7 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
                 ),
                 key=lambda node: node.last_access_time,
             )
-            x = self._select_ours_candidate(candidates, memory_kind="host_full")
+            x = self._select_ranked_candidate(candidates, memory_kind="host_full")
             if x is None:
                 break
             evicted = self._evict_host_leaf(x)
@@ -872,8 +883,8 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         return num_evicted
 
     def evict_host(self, num_tokens: int):
-        if self.rrmc_radix_eviction_policy == "ours":
-            self._evict_host_full_ours(num_tokens)
+        if self.rrmc_radix_eviction_policy in RRMC_RANKED_EVICTION_POLICIES:
+            self._evict_host_full_ranked(num_tokens)
             return
         return super().evict_host(num_tokens)
 
