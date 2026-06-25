@@ -545,8 +545,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 0.0 if depth_max == 0 else float(depths[node.id]) / float(depth_max)
             )
             score = (
-                recency_score
-                - self.depth_aware_evict_lambda * normalized_depth
+                self.depth_aware_evict_lambda * recency_score
+                - (1-self.depth_aware_evict_lambda) * normalized_depth
             )
             key = (score, node.last_access_time, node.id)
             if logger.isEnabledFor(logging.DEBUG):
