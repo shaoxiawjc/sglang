@@ -143,7 +143,19 @@ class MarconiCache(MambaRadixCache):
             mamba_attached = self._attach_mamba_to_node(new_last_node, req)
 
             self._free_req_kv(req, max(cached_len, input_len), kv_committed_len)
-            if not mamba_attached:
+            if mamba_attached:
+                # Main mamba slot ownership transferred to the tree node.
+                # Only release the extra ping-pong track buffers.
+                req.mamba_pool_idx = None
+                if (
+                    self.enable_mamba_extra_buffer
+                    and req.mamba_ping_pong_track_buffer is not None
+                ):
+                    self.req_to_token_pool.mamba_pool.free(
+                        req.mamba_ping_pong_track_buffer
+                    )
+                    req.mamba_ping_pong_track_buffer = None
+            else:
                 self._free_finished_req_mamba(req)
             self.dec_lock_ref(req.last_node)
             req.last_node = new_last_node
