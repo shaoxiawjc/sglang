@@ -166,21 +166,25 @@ class MarconiCache(MambaRadixCache):
     def cache_unfinished_req(self, req, chunked: bool = False) -> None:
         del chunked
         try:
-            token_ids = req.fill_ids
-            if self.disable or not token_ids:
-                return self._skip_cache_unfinished_req(req, len(token_ids))
+            total_tokens = len(req.fill_ids)
+            input_len = min(total_tokens, len(req.origin_input_ids))
+            input_len = self._align_down(input_len)
+            if self.disable or input_len <= 0:
+                return self._skip_cache_unfinished_req(req, total_tokens)
 
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(token_ids)
+            token_ids = req.fill_ids[:input_len]
+
+            kv_indices_orig = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :total_tokens
             ]
             cached_len, new_last_node = self._cache_input_kv_path(
                 req=req,
                 token_ids=token_ids,
-                kv_indices=kv_indices,
+                kv_indices=kv_indices_orig[:input_len],
                 duplicate_free_from=req.cache_protected_len,
             )
             if cached_len <= req.cache_protected_len:
-                return self._skip_cache_unfinished_req(req, len(token_ids))
+                return self._skip_cache_unfinished_req(req, total_tokens)
 
             canonical_indices = self._collect_prefix_indices(new_last_node)
             self.req_to_token_pool.write(
@@ -190,9 +194,9 @@ class MarconiCache(MambaRadixCache):
             self.dec_lock_ref(req.last_node)
             self.inc_lock_ref(new_last_node)
 
-            if cached_len < len(kv_indices):
+            if cached_len < len(kv_indices_orig):
                 req.prefix_indices = torch.cat(
-                    [canonical_indices, kv_indices[cached_len:]]
+                    [canonical_indices, kv_indices_orig[cached_len:]]
                 )
             else:
                 req.prefix_indices = canonical_indices
@@ -519,7 +523,10 @@ class MarconiCache(MambaRadixCache):
 
             if duplicate_free_from < total_prefix_len + prefix_len:
                 start = max(0, duplicate_free_from - total_prefix_len)
-                self.token_to_kv_pool_allocator.free(value[start:prefix_len])
+                self._free_duplicate_kv_indices(
+                    incoming=value[start:prefix_len],
+                    cached=child.value[start:prefix_len],
+                )
 
             total_prefix_len += prefix_len
             key = key[prefix_len:]
@@ -544,6 +551,18 @@ class MarconiCache(MambaRadixCache):
             self._on_token_node_created(new_node)
             node = new_node
         return node
+
+    def _free_duplicate_kv_indices(
+        self, *, incoming: torch.Tensor, cached: torch.Tensor
+    ) -> None:
+        """Free only newly allocated indices, not indices already owned by the tree."""
+        assert len(incoming) == len(cached), (
+            f"Marconi duplicate KV slices have different lengths: "
+            f"{len(incoming)=}, {len(cached)=}"
+        )
+        duplicate_indices = incoming[incoming != cached]
+        if duplicate_indices.numel() > 0:
+            self.token_to_kv_pool_allocator.free(duplicate_indices)
 
     def _split_len_for_forced_checkpoint(
         self,
