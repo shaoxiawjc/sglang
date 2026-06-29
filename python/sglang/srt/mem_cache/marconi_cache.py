@@ -178,9 +178,20 @@ class MarconiCache(MambaRadixCache):
             total_tokens = len(req.fill_ids)
             input_len = min(total_tokens, len(req.origin_input_ids))
             input_len = self._align_down(input_len)
-            if self.disable or input_len <= 0:
+            checkpoint_len = getattr(req, "_marconi_admission_seqlen", None)
+            if (
+                self.disable
+                or input_len <= 0
+                or checkpoint_len is None
+                or checkpoint_len > input_len
+                or checkpoint_len <= req.cache_protected_len
+            ):
                 return self._skip_cache_unfinished_req(req, total_tokens)
 
+            # Only transfer KV ownership through a captured Mamba checkpoint.
+            # A longer token-only tail cannot be protected by req.last_node and
+            # may otherwise be evicted while the unfinished request still uses it.
+            input_len = int(checkpoint_len)
             token_ids = req.fill_ids[:input_len]
 
             kv_indices_orig = self.req_to_token_pool.req_to_token[

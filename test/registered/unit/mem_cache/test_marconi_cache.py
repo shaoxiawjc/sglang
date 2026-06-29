@@ -132,6 +132,67 @@ class TestMarconiCachePageAlignment(unittest.TestCase):
 
         self.assertEqual(cache._align_down(min(600, 530)), 512)
 
+    def test_unfinished_only_inserts_through_reached_checkpoint(self):
+        cache = object.__new__(MarconiCache)
+        cache.disable = False
+        cache.page_size = 2
+        cache.root_node = TreeNode()
+        checkpoint_node = TreeNode()
+        canonical_indices = torch.tensor([100, 101, 102, 103], dtype=torch.int64)
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([[10, 11, 12, 13, 14, 15]], dtype=torch.int64),
+            write=Mock(),
+        )
+        cache._cache_input_kv_path = Mock(return_value=(4, checkpoint_node))
+        cache._collect_prefix_indices = Mock(return_value=canonical_indices)
+        cache.dec_lock_ref = Mock()
+        cache.inc_lock_ref = Mock()
+        cache._release_unattached_marconi_slots = Mock()
+        req = SimpleNamespace(
+            fill_ids=[1, 2, 3, 4, 5, 6],
+            origin_input_ids=[1, 2, 3, 4, 5, 6],
+            req_pool_idx=0,
+            cache_protected_len=0,
+            last_node=cache.root_node,
+            extra_key=None,
+            _marconi_admission_seqlen=4,
+        )
+
+        cache.cache_unfinished_req(req)
+
+        call = cache._cache_input_kv_path.call_args.kwargs
+        self.assertEqual(call["token_ids"], [1, 2, 3, 4])
+        self.assertTrue(
+            torch.equal(call["kv_indices"], torch.tensor([10, 11, 12, 13]))
+        )
+        self.assertTrue(
+            torch.equal(
+                req.prefix_indices,
+                torch.tensor([100, 101, 102, 103, 14, 15]),
+            )
+        )
+        self.assertEqual(req.cache_protected_len, 4)
+        self.assertIs(req.last_node, checkpoint_node)
+
+    def test_unfinished_without_reached_checkpoint_does_not_insert(self):
+        cache = object.__new__(MarconiCache)
+        cache.disable = False
+        cache.page_size = 2
+        cache._cache_input_kv_path = Mock()
+        cache._skip_cache_unfinished_req = Mock()
+        cache._release_unattached_marconi_slots = Mock()
+        req = SimpleNamespace(
+            fill_ids=[1, 2, 3, 4],
+            origin_input_ids=[1, 2, 3, 4, 5, 6],
+            cache_protected_len=0,
+            _marconi_admission_seqlen=6,
+        )
+
+        cache.cache_unfinished_req(req)
+
+        cache._cache_input_kv_path.assert_not_called()
+        cache._skip_cache_unfinished_req.assert_called_once_with(req, 4)
+
     def test_unfinished_preserves_unaligned_request_tail(self):
         cache = object.__new__(MarconiCache)
         cache.disable = False
@@ -155,6 +216,7 @@ class TestMarconiCachePageAlignment(unittest.TestCase):
             cache_protected_len=0,
             last_node=cache.root_node,
             extra_key=None,
+            _marconi_admission_seqlen=2,
         )
 
         cache.cache_unfinished_req(req)
