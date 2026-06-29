@@ -91,6 +91,8 @@ class MarconiCache(MambaRadixCache):
         self.total_marconi_created_states = 0
         self.total_marconi_state_capture_failures = 0
         self.total_marconi_skipped_states = 0
+        self.total_marconi_matched_prefix_tokens = 0
+        self.total_marconi_accepted_prefix_tokens = 0
 
     def reset(self) -> None:
         super().reset()
@@ -112,8 +114,15 @@ class MarconiCache(MambaRadixCache):
                 self.total_marconi_branch_candidates += 1
 
         if params.log_stats:
-            self._log_cache_stats(hit_tokens=len(result.device_indices))
+            hit_tokens = len(result.device_indices)
+            self.total_marconi_matched_prefix_tokens += hit_tokens
+            self._log_cache_stats(hit_tokens=hit_tokens)
         return result
+
+    def record_accepted_hit_tokens(self, hit_tokens: int, req=None) -> None:
+        super().record_accepted_hit_tokens(hit_tokens, req=req)
+        if hit_tokens > 0:
+            self.total_marconi_accepted_prefix_tokens += int(hit_tokens)
 
     def cache_finished_req(self, req, is_insert: bool = True) -> None:
         try:
@@ -226,6 +235,12 @@ class MarconiCache(MambaRadixCache):
                 ),
                 "total_marconi_skipped_states": int(
                     self.total_marconi_skipped_states
+                ),
+                "total_marconi_matched_prefix_tokens": int(
+                    self.total_marconi_matched_prefix_tokens
+                ),
+                "total_marconi_accepted_prefix_tokens": int(
+                    self.total_marconi_accepted_prefix_tokens
                 ),
             }
         )

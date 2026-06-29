@@ -670,6 +670,12 @@ def _aggregate_cache_metrics(
         "total_rrmc_boundary_state_capture_failures",
         "total_rrmc_accepted_state_hits",
         "total_rrmc_skipped_cold_boundaries",
+        "total_marconi_branch_candidates",
+        "total_marconi_created_states",
+        "total_marconi_state_capture_failures",
+        "total_marconi_skipped_states",
+        "total_marconi_matched_prefix_tokens",
+        "total_marconi_accepted_prefix_tokens",
     )
     for field in sum_fields:
         aggregate[field] = sum(int(metrics.get(field, 0) or 0) for metrics in per_scheduler)

@@ -169,5 +169,28 @@ class TestMarconiCachePageAlignment(unittest.TestCase):
         self.assertIs(req.last_node, new_last_node)
 
 
+class TestMarconiCacheMetrics(unittest.TestCase):
+    def test_accepted_prefix_tokens_update_generic_and_marconi_counters(self):
+        cache = object.__new__(MarconiCache)
+        cache._reset_cache_perf_counters()
+        cache.root_node = TreeNode()
+        cache.root_node.value = []
+
+        cache.record_accepted_hit_tokens(256)
+
+        metrics = cache.get_cache_metrics()
+        self.assertEqual(metrics["total_accepted_hit_tokens"], 256)
+        self.assertEqual(metrics["total_marconi_accepted_prefix_tokens"], 256)
+
+    def test_non_positive_accepted_prefix_tokens_are_ignored(self):
+        cache = object.__new__(MarconiCache)
+        cache._reset_cache_perf_counters()
+
+        cache.record_accepted_hit_tokens(0)
+
+        self.assertEqual(cache.total_accepted_hit_tokens, 0)
+        self.assertEqual(cache.total_marconi_accepted_prefix_tokens, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
