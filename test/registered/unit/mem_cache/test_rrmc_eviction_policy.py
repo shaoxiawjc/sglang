@@ -15,19 +15,33 @@ from sglang.srt.server_args import (
 )
 
 
-def make_cache(policy: str, depth_lambda: float = 0.5):
+def make_cache(
+    policy: str,
+    depth_lambda: float = 0.5,
+    depth_efficient_alpha: float = 0.33,
+    depth_efficient_beta: float = 0.33,
+):
     cache = object.__new__(RRMCMambaRadixCache)
     cache.root_node = TreeNode()
     cache.rrmc_radix_eviction_policy = policy
     cache.depth_aware_evict_lambda = depth_lambda
+    cache.depth_efficient_aware_alpha = depth_efficient_alpha
+    cache.depth_efficient_aware_beta = depth_efficient_beta
     return cache
 
 
-def add_child(parent: TreeNode, *, access_time: float, access_count: int = 1):
+def add_child(
+    parent: TreeNode,
+    *,
+    access_time: float,
+    access_count: int = 1,
+    token_length: int = 1,
+):
     node = TreeNode()
     node.parent = parent
     node.last_access_time = access_time
     node.rrmc_access_count = access_count
+    node.key = list(range(token_length))
     parent.children[node.id] = node
     return node
 
@@ -36,9 +50,12 @@ class TestRRMCEvictionPolicy(unittest.TestCase):
     def test_policy_choices_include_lfu_and_depth_aware(self):
         self.assertIn("lfu", RRMC_RADIX_EVICTION_POLICY_CHOICES)
         self.assertIn("depth_aware", RRMC_RADIX_EVICTION_POLICY_CHOICES)
+        self.assertIn(
+            "depth_efficient_aware", RRMC_RADIX_EVICTION_POLICY_CHOICES
+        )
         self.assertEqual(
             RRMC_RANKED_EVICTION_POLICIES,
-            {"lfu", "depth_aware", "ours"},
+            {"lfu", "depth_aware", "depth_efficient_aware", "ours"},
         )
 
     def test_lfu_prefers_lower_frequency(self):
@@ -77,8 +94,8 @@ class TestRRMCEvictionPolicy(unittest.TestCase):
         self.assertEqual(parent.rrmc_access_count, 2)
         self.assertEqual(child.rrmc_access_count, 4)
 
-    def test_depth_aware_can_prefer_newer_deeper_node(self):
-        cache = make_cache("depth_aware", depth_lambda=2.0)
+    def test_depth_aware_lambda_zero_prefers_deeper_node(self):
+        cache = make_cache("depth_aware", depth_lambda=0.0)
         shallow_old = add_child(cache.root_node, access_time=1.0)
         branch = add_child(cache.root_node, access_time=3.0)
         middle = add_child(branch, access_time=4.0)
@@ -90,8 +107,8 @@ class TestRRMCEvictionPolicy(unittest.TestCase):
 
         self.assertIs(selected, deep_new)
 
-    def test_depth_aware_lambda_zero_matches_lru(self):
-        cache = make_cache("depth_aware", depth_lambda=0.0)
+    def test_depth_aware_lambda_one_matches_lru(self):
+        cache = make_cache("depth_aware", depth_lambda=1.0)
         older = add_child(cache.root_node, access_time=1.0)
         branch = add_child(cache.root_node, access_time=3.0)
         newer_deep = add_child(branch, access_time=2.0)
@@ -111,6 +128,56 @@ class TestRRMCEvictionPolicy(unittest.TestCase):
             node,
         )
 
+    def test_depth_efficient_aware_zero_weights_matches_lru(self):
+        cache = make_cache(
+            "depth_efficient_aware",
+            depth_efficient_alpha=0.0,
+            depth_efficient_beta=0.0,
+        )
+        older = add_child(cache.root_node, access_time=1.0, token_length=8)
+        newer = add_child(cache.root_node, access_time=2.0, token_length=1)
+
+        selected = cache._select_ranked_candidate(
+            [newer, older], memory_kind="full"
+        )
+
+        self.assertIs(selected, older)
+
+    def test_depth_efficient_aware_alpha_can_prefer_deeper_node(self):
+        cache = make_cache(
+            "depth_efficient_aware",
+            depth_efficient_alpha=0.8,
+            depth_efficient_beta=0.0,
+        )
+        shallow_old = add_child(cache.root_node, access_time=1.0)
+        branch = add_child(cache.root_node, access_time=3.0)
+        deep_new = add_child(branch, access_time=2.0)
+
+        selected = cache._select_ranked_candidate(
+            [shallow_old, deep_new], memory_kind="full"
+        )
+
+        self.assertIs(selected, deep_new)
+
+    def test_depth_efficient_aware_beta_prefers_short_current_node(self):
+        cache = make_cache(
+            "depth_efficient_aware",
+            depth_efficient_alpha=0.0,
+            depth_efficient_beta=0.8,
+        )
+        older_long = add_child(
+            cache.root_node, access_time=1.0, token_length=10
+        )
+        newer_short = add_child(
+            cache.root_node, access_time=2.0, token_length=1
+        )
+
+        selected = cache._select_ranked_candidate(
+            [older_long, newer_short], memory_kind="full"
+        )
+
+        self.assertIs(selected, newer_short)
+
     def test_hirrmc_overrides_all_ranked_eviction_streams(self):
         self.assertIn("_evict_full_ranked", HiRRMCMambaRadixCache.__dict__)
         self.assertIn("_evict_mamba_ranked", HiRRMCMambaRadixCache.__dict__)
@@ -124,9 +191,25 @@ class TestRRMCEvictionPolicy(unittest.TestCase):
             rrmc_radix_eviction_policy="depth_aware",
             ours_evict_alpha=0.5,
             depth_aware_evict_lambda=-0.1,
+            depth_efficient_aware_alpha=0.33,
+            depth_efficient_aware_beta=0.33,
         )
 
         with self.assertRaisesRegex(ValueError, "should be non-negative"):
+            ServerArgs._handle_rrmc_eviction_policy(args)
+
+    def test_depth_efficient_aware_rejects_weight_sum_above_one(self):
+        args = SimpleNamespace(
+            enable_rrmc_radix_cache=True,
+            enable_marconi_cache=False,
+            rrmc_radix_eviction_policy="depth_efficient_aware",
+            ours_evict_alpha=0.5,
+            depth_aware_evict_lambda=0.5,
+            depth_efficient_aware_alpha=0.6,
+            depth_efficient_aware_beta=0.5,
+        )
+
+        with self.assertRaisesRegex(ValueError, "should not exceed 1"):
             ServerArgs._handle_rrmc_eviction_policy(args)
 
 

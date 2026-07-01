@@ -37,11 +37,14 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         self._init_rrmc_eviction_policy(params, server_args)
         logger.info(
             "Initialized HiRRMCMambaRadixCache with eviction policy=%s, "
-            "ours_alpha=%s, depth_lambda=%s, segment_size=%s, admission=%s, "
+            "ours_alpha=%s, depth_lambda=%s, depth_efficient_alpha=%s, "
+            "depth_efficient_beta=%s, segment_size=%s, admission=%s, "
             "admission_min_accesses=%s",
             self.rrmc_radix_eviction_policy,
             self.ours_evict_alpha,
             self.depth_aware_evict_lambda,
+            self.depth_efficient_aware_alpha,
+            self.depth_efficient_aware_beta,
             self.rrmc_segment_size,
             self.enable_rrmc_admission,
             self.rrmc_admission_min_accesses,

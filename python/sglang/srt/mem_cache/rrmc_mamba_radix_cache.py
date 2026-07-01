@@ -26,7 +26,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-RRMC_RANKED_EVICTION_POLICIES = {"lfu", "depth_aware", "ours"}
+RRMC_RANKED_EVICTION_POLICIES = {
+    "lfu",
+    "depth_aware",
+    "depth_efficient_aware",
+    "ours",
+}
 
 ANSI_RESET = "\x1b[0m"
 ANSI_CYAN = "\x1b[36m"
@@ -163,11 +168,14 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self._init_rrmc_eviction_policy(params, server_args)
         logger.info(
             "Initialized RRMCMambaRadixCache with eviction policy: %s, "
-            "ours_alpha=%s, depth_lambda=%s, segment_size=%s, admission=%s, "
+            "ours_alpha=%s, depth_lambda=%s, depth_efficient_alpha=%s, "
+            "depth_efficient_beta=%s, segment_size=%s, admission=%s, "
             "admission_min_accesses=%s",
             self.rrmc_radix_eviction_policy,
             self.ours_evict_alpha,
             self.depth_aware_evict_lambda,
+            self.depth_efficient_aware_alpha,
+            self.depth_efficient_aware_beta,
             self.rrmc_segment_size,
             self.enable_rrmc_admission,
             self.rrmc_admission_min_accesses,
@@ -181,6 +189,12 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self.ours_evict_alpha = float(getattr(server_args, "ours_evict_alpha", 0.5))
         self.depth_aware_evict_lambda = float(
             getattr(server_args, "depth_aware_evict_lambda", 0.5)
+        )
+        self.depth_efficient_aware_alpha = float(
+            getattr(server_args, "depth_efficient_aware_alpha", 0.33)
+        )
+        self.depth_efficient_aware_beta = float(
+            getattr(server_args, "depth_efficient_aware_beta", 0.33)
         )
         self.rrmc_model_config = getattr(params, "model_config", None)
 
@@ -565,6 +579,66 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 best_node = node
         return best_node
 
+    def _select_depth_efficient_aware_candidate(
+        self, candidates: list[TreeNode]
+    ) -> Optional[TreeNode]:
+        if not candidates:
+            return None
+
+        ordered = sorted(candidates, key=lambda node: (node.last_access_time, node.id))
+        depths = {node.id: self._rrmc_node_depth(node) for node in ordered}
+        token_lengths = {node.id: len(node.key) for node in ordered}
+        depth_max = max(depths.values(), default=0)
+        token_length_max = max(token_lengths.values(), default=0)
+        recency_denom = max(1, len(ordered) - 1)
+
+        alpha = self.depth_efficient_aware_alpha
+        beta = self.depth_efficient_aware_beta
+        recency_weight = 1.0 - alpha - beta
+
+        best_node: Optional[TreeNode] = None
+        best_key: Optional[tuple[float, float, int]] = None
+        for rank, node in enumerate(ordered):
+            recency_score = (
+                0.0 if len(ordered) == 1 else float(rank) / float(recency_denom)
+            )
+            normalized_depth = (
+                0.0 if depth_max == 0 else float(depths[node.id]) / float(depth_max)
+            )
+            normalized_token_length = (
+                0.0
+                if token_length_max == 0
+                else float(token_lengths[node.id]) / float(token_length_max)
+            )
+            score = (
+                recency_weight * recency_score
+                - alpha * normalized_depth
+                + beta * normalized_token_length
+            )
+            key = (score, node.last_access_time, node.id)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "RRMC depth-efficient-aware eviction candidate: "
+                    "alpha=%.3f beta=%.3f node=%s depth=%s depth_max=%s "
+                    "token_length=%s token_length_max=%s R=%.6f D=%.6f "
+                    "L=%.6f S=%.6f",
+                    alpha,
+                    beta,
+                    node.id,
+                    depths[node.id],
+                    depth_max,
+                    token_lengths[node.id],
+                    token_length_max,
+                    recency_score,
+                    normalized_depth,
+                    normalized_token_length,
+                    score,
+                )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_node = node
+        return best_node
+
     def _select_ranked_candidate(
         self,
         candidates: list[TreeNode],
@@ -577,6 +651,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
             return self._select_lfu_candidate(candidates)
         if self.rrmc_radix_eviction_policy == "depth_aware":
             return self._select_depth_aware_candidate(candidates)
+        if self.rrmc_radix_eviction_policy == "depth_efficient_aware":
+            return self._select_depth_efficient_aware_candidate(candidates)
         raise ValueError(
             f"Unsupported ranked RRMC eviction policy: "
             f"{self.rrmc_radix_eviction_policy!r}"

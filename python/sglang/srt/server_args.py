@@ -174,7 +174,13 @@ NSA_CHOICES = [
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
-RRMC_RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "depth_aware", "ours"]
+RRMC_RADIX_EVICTION_POLICY_CHOICES = [
+    "lru",
+    "lfu",
+    "depth_aware",
+    "depth_efficient_aware",
+    "ours",
+]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -362,6 +368,8 @@ class ServerArgs:
     rrmc_radix_eviction_policy: str = "lru"
     ours_evict_alpha: float = 0.5
     depth_aware_evict_lambda: float = 0.5
+    depth_efficient_aware_alpha: float = 0.33
+    depth_efficient_aware_beta: float = 0.33
     enable_rrmc_admission: bool = False
     rrmc_admission_min_accesses: int = 2
     enable_prefill_delayer: bool = False
@@ -923,6 +931,10 @@ class ServerArgs:
         self.rrmc_radix_eviction_policy = self.rrmc_radix_eviction_policy.lower()
         self.ours_evict_alpha = float(self.ours_evict_alpha)
         self.depth_aware_evict_lambda = float(self.depth_aware_evict_lambda)
+        self.depth_efficient_aware_alpha = float(
+            self.depth_efficient_aware_alpha
+        )
+        self.depth_efficient_aware_beta = float(self.depth_efficient_aware_beta)
         if self.rrmc_radix_eviction_policy not in RRMC_RADIX_EVICTION_POLICY_CHOICES:
             raise ValueError(
                 f"Invalid rrmc_radix_eviction_policy: "
@@ -933,6 +945,23 @@ class ServerArgs:
             raise ValueError("--ours-evict-alpha should be in range [0, 1].")
         if self.depth_aware_evict_lambda < 0.0:
             raise ValueError("--depth-aware-evict-lambda should be non-negative.")
+        if self.depth_efficient_aware_alpha < 0.0:
+            raise ValueError(
+                "--depth-efficient-aware-alpha should be non-negative."
+            )
+        if self.depth_efficient_aware_beta < 0.0:
+            raise ValueError(
+                "--depth-efficient-aware-beta should be non-negative."
+            )
+        if (
+            self.depth_efficient_aware_alpha
+            + self.depth_efficient_aware_beta
+            > 1.0
+        ):
+            raise ValueError(
+                "--depth-efficient-aware-alpha + --depth-efficient-aware-beta "
+                "should not exceed 1."
+            )
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -4067,6 +4096,25 @@ class ServerArgs:
             help=(
                 "Depth penalty weight for RRMC depth-aware eviction. "
                 "Must be non-negative."
+            ),
+        )
+        parser.add_argument(
+            "--depth-efficient-aware-alpha",
+            type=float,
+            default=ServerArgs.depth_efficient_aware_alpha,
+            help=(
+                "Depth weight for RRMC depth-efficient-aware eviction. "
+                "Alpha and beta must be non-negative and sum to at most 1."
+            ),
+        )
+        parser.add_argument(
+            "--depth-efficient-aware-beta",
+            type=float,
+            default=ServerArgs.depth_efficient_aware_beta,
+            help=(
+                "Normalized current-node token-length weight for RRMC "
+                "depth-efficient-aware eviction. Alpha and beta must be "
+                "non-negative and sum to at most 1."
             ),
         )
         parser.add_argument(
