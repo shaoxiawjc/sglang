@@ -78,11 +78,14 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         self._warned_page_size = False
         self._warned_bad_metadata = False
         self._rrmc_write_back_node_ids.clear()
+        self._init_rrmc_ranked_eviction_heaps()
 
     def reset(self) -> None:
         super().reset()
         if hasattr(self, "_rrmc_write_back_node_ids"):
             self._rrmc_write_back_node_ids.clear()
+        if hasattr(self, "_rrmc_ranked_heaps"):
+            self._init_rrmc_ranked_eviction_heaps()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         req = params.req
@@ -434,6 +437,7 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
                         child
                     ):
                         self.mamba_lru_list.reset_node_mru(child)
+                    self._rrmc_mark_node_updated(child)
                     if segment.end > duplicate_free_from:
                         duplicate_ranges.append((segment.start, segment.end))
 
@@ -535,6 +539,8 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
             self.mamba_lru_list.remove_node(node)
         self._on_checkpoint_evicted(node)
         node.mamba_value = None
+        self._rrmc_invalidate_node(node)
+        self._rrmc_mark_node_updated(node)
         return mamba_num
 
     def _free_host_mamba_for_node(self, node: TreeNode) -> int:
@@ -545,6 +551,8 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         count = len(node.mamba_host_value)
         self.mamba_pool_host.free(node.mamba_host_value)
         node.mamba_host_value = None
+        self._rrmc_invalidate_node(node)
+        self._rrmc_mark_node_updated(node)
         return count
 
     def _backup_mamba_to_host(self, node: TreeNode) -> int:
@@ -553,6 +561,7 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         if node.mamba_host_value is not None:
             if self.mamba_host_lru_list.in_list(node):
                 self.mamba_host_lru_list.reset_node_mru(node)
+                self._rrmc_mark_node_updated(node)
             return len(node.mamba_host_value)
         if node.id in self.ongoing_write_through:
             self.writing_check(write_back=True)
@@ -575,6 +584,7 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         self.mamba_backup_commit(node, transfers)
         self.ongoing_write_through[node.id] = node
         self.writing_check(write_back=True)
+        self._rrmc_mark_node_updated(node)
         return len(node.mamba_host_value) if node.mamba_host_value is not None else 0
 
     def _has_kv_residency(self, node: TreeNode) -> bool:
@@ -613,6 +623,8 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         self._discard_from_leaf_sets(node)
         self._remove_rrmc_child_from_parent(node)
         self._update_leaf_status(node.parent)
+        self._rrmc_invalidate_node(node)
+        self._rrmc_mark_node_updated(node.parent)
         return True
 
     def _repair_invalid_rrmc_boundary_state(self, node: TreeNode) -> bool:
@@ -693,6 +705,9 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
 
         self._update_leaf_status(node)
         self._update_full_device_leaf_status(node.parent)
+        self._rrmc_invalidate_node(node)
+        self._rrmc_mark_node_updated(node)
+        self._rrmc_mark_node_updated(node.parent)
         return num_full, mamba_num
 
     def _evict_full_ranked(self, full_num_tokens: int) -> int:
@@ -702,20 +717,11 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         full_num_evicted = 0
         skipped_ids: set[int] = set()
         while full_num_evicted < full_num_tokens:
-            candidates = sorted(
-                (
-                    node
-                    for node in self.evictable_full_device_leaves
-                    if node.id not in skipped_ids
-                    and self._is_full_device_evictable_node(node)
-                ),
-                key=lambda node: node.last_access_time,
-            )
-            x = self._select_ranked_candidate(
-                candidates, memory_kind="device_full"
-            )
+            x = self._pop_rrmc_ranked_candidate("device_full")
             if x is None:
                 break
+            if x.id in skipped_ids:
+                continue
 
             evicted_full, evicted_mamba = self._evict_device_leaf(x)
             if evicted_full <= 0 and evicted_mamba <= 0:
@@ -736,20 +742,11 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         mamba_num_evicted = 0
         skipped_ids: set[int] = set()
         while mamba_num_evicted < mamba_num:
-            candidates = [
-                node
-                for node in self._collect_lru_stream_candidates(
-                    self.mamba_lru_list,
-                    leaf_only=False,
-                    excluded_ids=skipped_ids,
-                )
-                if len(node.children) > 0 or self._is_full_device_evictable_node(node)
-            ]
-            x = self._select_ranked_candidate(
-                candidates, memory_kind="device_mamba"
-            )
+            x = self._pop_rrmc_ranked_candidate("device_mamba")
             if x is None:
                 break
+            if x.id in skipped_ids:
+                continue
 
             assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
             assert x != self.root_node, f"root node is not evictable, {x.id=}"
@@ -806,18 +803,11 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         num_evicted = 0
         skipped_ids: set[int] = set()
         while num_evicted < num_mamba_hosts:
-            candidates = [
-                node
-                for node in self._collect_lru_stream_candidates(
-                    self.mamba_host_lru_list,
-                    leaf_only=False,
-                    excluded_ids=skipped_ids,
-                )
-                if node.host_ref_counter == 0
-            ]
-            x = self._select_ranked_candidate(candidates, memory_kind="host_mamba")
+            x = self._pop_rrmc_ranked_candidate("host_mamba")
             if x is None:
                 break
+            if x.id in skipped_ids:
+                continue
 
             if len(x.children) == 0 and x in self.evictable_full_host_leaves:
                 if self._evict_host_leaf(x) > 0:
@@ -866,17 +856,11 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         num_evicted = 0
         skipped_ids: set[int] = set()
         while num_evicted < num_tokens:
-            candidates = sorted(
-                (
-                    node
-                    for node in self.evictable_full_host_leaves
-                    if node.id not in skipped_ids and node.host_ref_counter == 0
-                ),
-                key=lambda node: node.last_access_time,
-            )
-            x = self._select_ranked_candidate(candidates, memory_kind="host_full")
+            x = self._pop_rrmc_ranked_candidate("host_full")
             if x is None:
                 break
+            if x.id in skipped_ids:
+                continue
             evicted = self._evict_host_leaf(x)
             if evicted <= 0:
                 skipped_ids.add(x.id)
@@ -911,10 +895,12 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         self._remove_rrmc_child_from_parent(node)
 
         parent = node.parent
+        self._rrmc_invalidate_node(node)
         self._update_leaf_status(parent)
         _, cascade_full_num_evicted, cascade_mamba_num_evicted = (
             self._iteratively_delete_tombstone_leaf(node)
         )
+        self._rrmc_mark_node_updated(parent)
         return (
             full_num_evicted + cascade_full_num_evicted,
             mamba_num_evicted + cascade_mamba_num_evicted,
@@ -939,8 +925,10 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
         self._remove_rrmc_child_from_parent(node)
 
         parent = node.parent
+        self._rrmc_invalidate_node(node)
         self._update_leaf_status(parent)
         _, cascade_full_num_evicted, _ = self._iteratively_delete_tombstone_leaf(node)
+        self._rrmc_mark_node_updated(parent)
 
         return full_num_evicted + cascade_full_num_evicted
 
@@ -956,6 +944,8 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
 
         self._remove_rrmc_child_from_parent(node)
         self._update_leaf_status(node.parent)
+        self._rrmc_invalidate_node(node)
+        self._rrmc_mark_node_updated(node.parent)
 
     def _iteratively_delete_tombstone_leaf(
         self, node: TreeNode
@@ -984,6 +974,7 @@ class HiRRMCMambaRadixCache(RRMCMambaRadixCache, HiMambaRadixCache):
 
             self._discard_from_leaf_sets(parent)
             self._delete_tombstone_leaf(parent)
+            self._rrmc_invalidate_node(parent)
             node = parent
 
         return node, full_num_evicted, mamba_num_evicted

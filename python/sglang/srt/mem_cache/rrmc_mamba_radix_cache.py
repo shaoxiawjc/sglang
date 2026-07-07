@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import heapq
 import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional
@@ -166,6 +167,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self._warned_page_size = False
         self._warned_bad_metadata = False
         self._init_rrmc_eviction_policy(params, server_args)
+        self._init_rrmc_ranked_eviction_heaps()
         logger.info(
             "Initialized RRMCMambaRadixCache with eviction policy: %s, "
             "ours_alpha=%s, depth_lambda=%s, depth_efficient_alpha=%s, "
@@ -198,10 +200,247 @@ class RRMCMambaRadixCache(MambaRadixCache):
         )
         self.rrmc_model_config = getattr(params, "model_config", None)
 
+    def _init_rrmc_ranked_eviction_heaps(self) -> None:
+        self._rrmc_ranked_heaps: dict[str, list[tuple[Any, float, int, int, TreeNode]]] = {
+            "full": [],
+            "mamba": [],
+            "device_full": [],
+            "device_mamba": [],
+            "host_full": [],
+            "host_mamba": [],
+        }
+
+    def _ensure_rrmc_ranked_eviction_heaps(self) -> None:
+        if not hasattr(self, "_rrmc_ranked_heaps"):
+            self._init_rrmc_ranked_eviction_heaps()
+
+    @staticmethod
+    def _rrmc_next_heap_version(node: TreeNode) -> int:
+        version = int(getattr(node, "rrmc_heap_version", 0)) + 1
+        node.rrmc_heap_version = version
+        return version
+
+    def _rrmc_invalidate_node(self, node: Optional[TreeNode]) -> None:
+        if node is None:
+            return
+        self._rrmc_next_heap_version(node)
+
+    def _rrmc_mark_node_updated(self, node: Optional[TreeNode]) -> None:
+        if node is None or node is self.root_node:
+            return
+        self._ensure_rrmc_ranked_eviction_heaps()
+        version = self._rrmc_next_heap_version(node)
+        for memory_kind in self._rrmc_ranked_candidate_kinds_for_node(node):
+            entry = self._rrmc_make_heap_entry(node, memory_kind, version)
+            if entry is not None:
+                heapq.heappush(self._rrmc_ranked_heaps[memory_kind], entry)
+
+    def _rrmc_mark_path_updated(self, node: Optional[TreeNode]) -> None:
+        while node is not None and node is not self.root_node:
+            self._rrmc_mark_node_updated(node)
+            node = node.parent
+
+    def _rrmc_ranked_candidate_kinds_for_node(self, node: TreeNode) -> tuple[str, ...]:
+        kinds: list[str] = []
+        if self._rrmc_is_valid_ranked_candidate(node, "full"):
+            kinds.append("full")
+        if self._rrmc_is_valid_ranked_candidate(node, "mamba"):
+            kinds.append("mamba")
+        if hasattr(self, "evictable_full_device_leaves"):
+            if self._rrmc_is_valid_ranked_candidate(node, "device_full"):
+                kinds.append("device_full")
+            if self._rrmc_is_valid_ranked_candidate(node, "device_mamba"):
+                kinds.append("device_mamba")
+        if hasattr(self, "evictable_full_host_leaves"):
+            if self._rrmc_is_valid_ranked_candidate(node, "host_full"):
+                kinds.append("host_full")
+            if self._rrmc_is_valid_ranked_candidate(node, "host_mamba"):
+                kinds.append("host_mamba")
+        return tuple(kinds)
+
+    def _rrmc_is_valid_ranked_candidate(self, node: TreeNode, memory_kind: str) -> bool:
+        if node is None or node is self.root_node:
+            return False
+
+        if memory_kind == "full":
+            return (
+                node.value is not None
+                and len(node.children) == 0
+                and node.full_lock_ref == 0
+                and node.mamba_lock_ref == 0
+                and self.full_lru_list.in_list(node)
+            )
+
+        if memory_kind == "mamba":
+            if (
+                node.mamba_value is None
+                or node.mamba_lock_ref != 0
+                or not self.mamba_lru_list.in_list(node)
+            ):
+                return False
+            if len(node.children) == 0:
+                return node.value is not None and node.full_lock_ref == 0
+            return True
+
+        if memory_kind == "device_full":
+            return bool(
+                hasattr(self, "_is_full_device_evictable_node")
+                and self._is_full_device_evictable_node(node)
+            )
+
+        if memory_kind == "device_mamba":
+            if (
+                node.mamba_value is None
+                or node.mamba_lock_ref != 0
+                or not self.mamba_lru_list.in_list(node)
+            ):
+                return False
+            return len(node.children) > 0 or bool(
+                hasattr(self, "_is_full_device_evictable_node")
+                and self._is_full_device_evictable_node(node)
+            )
+
+        if memory_kind == "host_full":
+            return bool(
+                hasattr(self, "evictable_full_host_leaves")
+                and node in self.evictable_full_host_leaves
+                and node.host_ref_counter == 0
+            )
+
+        if memory_kind == "host_mamba":
+            mamba_host_lru_list = getattr(self, "mamba_host_lru_list", None)
+            return bool(
+                mamba_host_lru_list is not None
+                and node.mamba_host_value is not None
+                and node.host_ref_counter == 0
+                and mamba_host_lru_list.in_list(node)
+            )
+
+        raise ValueError(f"Unsupported RRMC ranked heap memory kind: {memory_kind!r}")
+
+    def _rrmc_recency_score(self, node: TreeNode) -> float:
+        current_time = max(1.0, float(TreeNode.last_access_time_counter_float))
+        return max(0.0, min(1.0, float(node.last_access_time) / current_time))
+
+    def _rrmc_normalized_depth(self, node: TreeNode) -> float:
+        depth = getattr(node, "rrmc_depth", None)
+        if depth is None:
+            depth = self._rrmc_node_depth(node)
+            node.rrmc_depth = int(depth)
+        max_depth = max(1, int(getattr(self, "_rrmc_max_depth_seen", depth)))
+        return float(depth) / float(max_depth)
+
+    def _rrmc_normalized_token_length(self, node: TreeNode) -> float:
+        token_length = len(node.key) if node.key is not None else 0
+        max_token_length = max(
+            1, int(getattr(self, "_rrmc_max_token_length_seen", token_length))
+        )
+        return float(token_length) / float(max_token_length)
+
+    def _rrmc_heap_score(self, node: TreeNode, memory_kind: str) -> Any:
+        if self.rrmc_radix_eviction_policy == "lfu":
+            self._ensure_rrmc_eviction_fields(node)
+            return (int(node.rrmc_access_count), float(node.last_access_time))
+
+        recency_score = self._rrmc_recency_score(node)
+
+        if self.rrmc_radix_eviction_policy == "depth_aware":
+            score = (
+                self.depth_aware_evict_lambda * recency_score
+                - (1.0 - self.depth_aware_evict_lambda)
+                * self._rrmc_normalized_depth(node)
+            )
+            return score
+
+        if self.rrmc_radix_eviction_policy == "depth_efficient_aware":
+            alpha = self.depth_efficient_aware_alpha
+            beta = self.depth_efficient_aware_beta
+            score = (
+                (1.0 - alpha - beta) * recency_score
+                - alpha * self._rrmc_normalized_depth(node)
+                + beta * self._rrmc_normalized_token_length(node)
+            )
+            return score
+
+        if self.rrmc_radix_eviction_policy == "ours":
+            raw_efficiency = self._rrmc_saved_flops(self._rrmc_node_prefix_len(node)) / (
+                self._rrmc_candidate_memory_bytes(node, memory_kind)
+            )
+            return recency_score + self.ours_evict_alpha * math.log1p(raw_efficiency)
+
+        raise ValueError(
+            f"Unsupported ranked RRMC eviction policy: "
+            f"{self.rrmc_radix_eviction_policy!r}"
+        )
+
+    def _rrmc_make_heap_entry(
+        self, node: TreeNode, memory_kind: str, version: int
+    ) -> Optional[tuple[Any, float, int, int, TreeNode]]:
+        if not self._rrmc_is_valid_ranked_candidate(node, memory_kind):
+            return None
+        return (
+            self._rrmc_heap_score(node, memory_kind),
+            float(node.last_access_time),
+            int(node.id),
+            int(version),
+            node,
+        )
+
+    def _rrmc_rebuild_ranked_heap(self, memory_kind: str) -> None:
+        self._ensure_rrmc_ranked_eviction_heaps()
+        entries: list[tuple[Any, float, int, int, TreeNode]] = []
+        for node in self._rrmc_ranked_heap_seed_nodes(memory_kind):
+            version = int(getattr(node, "rrmc_heap_version", 0))
+            entry = self._rrmc_make_heap_entry(node, memory_kind, version)
+            if entry is not None:
+                entries.append(entry)
+        heapq.heapify(entries)
+        self._rrmc_ranked_heaps[memory_kind] = entries
+
+    def _rrmc_ranked_heap_seed_nodes(self, memory_kind: str) -> list[TreeNode]:
+        if memory_kind == "full":
+            return list(self.full_lru_list.cache.values())
+        if memory_kind in {"mamba", "device_mamba"}:
+            return list(self.mamba_lru_list.cache.values())
+        if memory_kind == "device_full":
+            return list(getattr(self, "evictable_full_device_leaves", ()))
+        if memory_kind == "host_full":
+            return list(getattr(self, "evictable_full_host_leaves", ()))
+        if memory_kind == "host_mamba":
+            mamba_host_lru_list = getattr(self, "mamba_host_lru_list", None)
+            return [] if mamba_host_lru_list is None else list(mamba_host_lru_list.cache.values())
+        raise ValueError(f"Unsupported RRMC ranked heap memory kind: {memory_kind!r}")
+
+    def _pop_rrmc_ranked_candidate(self, memory_kind: str) -> Optional[TreeNode]:
+        self._ensure_rrmc_ranked_eviction_heaps()
+        rebuilt = False
+        heap = self._rrmc_ranked_heaps[memory_kind]
+        if not heap:
+            self._rrmc_rebuild_ranked_heap(memory_kind)
+            rebuilt = True
+            heap = self._rrmc_ranked_heaps[memory_kind]
+
+        while True:
+            while heap:
+                _score, _access_time, _node_id, version, node = heapq.heappop(heap)
+                if version != int(getattr(node, "rrmc_heap_version", 0)):
+                    continue
+                if not self._rrmc_is_valid_ranked_candidate(node, memory_kind):
+                    continue
+                return node
+            if rebuilt:
+                return None
+            self._rrmc_rebuild_ranked_heap(memory_kind)
+            rebuilt = True
+            heap = self._rrmc_ranked_heaps[memory_kind]
+        return None
+
     def reset(self) -> None:
         super().reset()
         if hasattr(self, "rrmc_admission_counts"):
             self.rrmc_admission_counts.clear()
+        if hasattr(self, "_rrmc_ranked_heaps"):
+            self._init_rrmc_ranked_eviction_heaps()
 
     def _reset_cache_perf_counters(self) -> None:
         super()._reset_cache_perf_counters()
@@ -284,6 +523,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         for node in nodes:
             self._ensure_rrmc_eviction_fields(node)
             node.rrmc_access_count += 1
+            self._rrmc_mark_node_updated(node)
 
     def _rrmc_node_depth(self, node: TreeNode) -> int:
         depth = 0
@@ -853,12 +1093,11 @@ class RRMCMambaRadixCache(MambaRadixCache):
         full_num_evicted = 0
         skipped_ids: set[int] = set()
         while full_num_evicted < full_num_tokens:
-            candidates = self._collect_lru_stream_candidates(
-                self.full_lru_list, leaf_only=True, excluded_ids=skipped_ids
-            )
-            x = self._select_ranked_candidate(candidates, memory_kind="full")
+            x = self._pop_rrmc_ranked_candidate("full")
             if x is None:
                 break
+            if x.id in skipped_ids:
+                continue
             full_num_evicted_delta, mamba_num_evicted_delta, _, _ = (
                 self._evict_leaf_node(x, False)
             )
@@ -880,12 +1119,11 @@ class RRMCMambaRadixCache(MambaRadixCache):
         mamba_num_evicted = 0
         skipped_ids: set[int] = set()
         while mamba_num_evicted < mamba_num:
-            candidates = self._collect_lru_stream_candidates(
-                self.mamba_lru_list, leaf_only=False, excluded_ids=skipped_ids
-            )
-            x = self._select_ranked_candidate(candidates, memory_kind="mamba")
+            x = self._pop_rrmc_ranked_candidate("mamba")
             if x is None:
                 break
+            if x.id in skipped_ids:
+                continue
 
             assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
             assert (
@@ -899,6 +1137,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 mamba_num_evicted += len(x.mamba_value)
                 self.mamba_lru_list.remove_node(x)
                 self._tombstone_internal_node(x)
+                self._rrmc_invalidate_node(x)
             else:
                 _, mamba_evicted_delta, _, _ = self._evict_leaf_node(x, True)
                 if mamba_evicted_delta <= 0:
@@ -920,6 +1159,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self._on_token_node_evicted(node)
         self.full_evictable_size_ -= len(node.key)
         self.mamba_evictable_size_ -= len(node.mamba_value)
+        self._rrmc_invalidate_node(node)
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
         assert node.mamba_value is None, (
@@ -931,6 +1171,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         assert v == node, f"Parent does not have RRMC child key, {key}"
         self._on_token_node_evicted(node)
         self.full_evictable_size_ -= len(node.key)
+        self._rrmc_invalidate_node(node)
 
     def _evict_leaf_node(
         self, x: TreeNode, is_evict_mamba: bool
@@ -940,6 +1181,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
         assert x.value is not None, f"leaf node has no KV value, {x.id=}"
 
+        parent = x.parent
         has_mamba = x.mamba_value is not None
         if has_mamba:
             self._on_checkpoint_evicted(x)
@@ -964,7 +1206,18 @@ class RRMCMambaRadixCache(MambaRadixCache):
 
         x, leaf_full_num_evicted = self._iteratively_delete_tombstone_leaf(x)
         full_num_evicted += leaf_full_num_evicted
+        self._rrmc_mark_node_updated(parent)
         return full_num_evicted, mamba_num_evicted, x, x_next
+
+    def inc_lock_ref(self, node: TreeNode):
+        result = super().inc_lock_ref(node)
+        self._rrmc_mark_path_updated(node)
+        return result
+
+    def dec_lock_ref(self, node: TreeNode, params=None):
+        result = super().dec_lock_ref(node, params=params)
+        self._rrmc_mark_path_updated(node)
+        return result
 
     def _empty_match_result(self) -> MatchResult:
         return MatchResult(
@@ -1392,10 +1645,18 @@ class RRMCMambaRadixCache(MambaRadixCache):
         node.rrmc_is_block_end = segment.is_block_end
         node.rrmc_prefix_tokens = segment.end
         node.rrmc_access_count = 1
+        node.rrmc_depth = int(getattr(parent, "rrmc_depth", 0)) + 1
+        self._rrmc_max_depth_seen = max(
+            int(getattr(self, "_rrmc_max_depth_seen", 0)), int(node.rrmc_depth)
+        )
+        self._rrmc_max_token_length_seen = max(
+            int(getattr(self, "_rrmc_max_token_length_seen", 0)), len(node.key)
+        )
         parent.children[tree_key] = node
         self.full_lru_list.insert_mru(node)
         self.full_evictable_size_ += len(node.value)
         self._on_token_node_created(node)
+        self._rrmc_mark_node_updated(node)
         return node
 
     def _ensure_mamba_on_node(
@@ -1416,6 +1677,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
         self.mamba_lru_list.insert_mru(node)
         self.mamba_evictable_size_ += len(node.mamba_value)
         self._on_checkpoint_created(node)
+        self._rrmc_mark_node_updated(node)
         self._mark_rrmc_boundary_slot_attached(
             req, int(getattr(node, "rrmc_prefix_tokens", 0))
         )
@@ -1470,6 +1732,7 @@ class RRMCMambaRadixCache(MambaRadixCache):
                 self.full_lru_list.reset_node_mru(child)
                 if child.mamba_value is not None:
                     self.mamba_lru_list.reset_node_mru(child)
+                self._rrmc_mark_node_updated(child)
                 if segment.end > duplicate_free_from:
                     duplicate_ranges.append((segment.start, segment.end))
             node = child

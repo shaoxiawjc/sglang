@@ -1,10 +1,12 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.mem_cache.hi_rrmc_mamba_radix_cache import (
     HiRRMCMambaRadixCache,
 )
-from sglang.srt.mem_cache.mamba_radix_cache import TreeNode
+from sglang.srt.mem_cache.mamba_radix_cache import LRUList, TreeNode
 from sglang.srt.mem_cache.rrmc_mamba_radix_cache import (
     RRMC_RANKED_EVICTION_POLICIES,
     RRMCMambaRadixCache,
@@ -27,6 +29,14 @@ def make_cache(
     cache.depth_aware_evict_lambda = depth_lambda
     cache.depth_efficient_aware_alpha = depth_efficient_alpha
     cache.depth_efficient_aware_beta = depth_efficient_beta
+    cache._init_rrmc_ranked_eviction_heaps()
+    return cache
+
+
+def make_heap_cache(policy: str):
+    cache = make_cache(policy)
+    cache.full_lru_list = LRUList(mamba=False)
+    cache.mamba_lru_list = LRUList(mamba=True)
     return cache
 
 
@@ -43,6 +53,26 @@ def add_child(
     node.rrmc_access_count = access_count
     node.key = list(range(token_length))
     parent.children[node.id] = node
+    return node
+
+
+def add_full_heap_leaf(
+    cache,
+    *,
+    access_time: float,
+    access_count: int,
+    token_length: int = 1,
+):
+    node = add_child(
+        cache.root_node,
+        access_time=access_time,
+        access_count=access_count,
+        token_length=token_length,
+    )
+    node.value = torch.arange(token_length, dtype=torch.int64)
+    node.rrmc_depth = 1
+    cache.full_lru_list.insert_mru(node)
+    cache._rrmc_mark_node_updated(node)
     return node
 
 
@@ -93,6 +123,37 @@ class TestRRMCEvictionPolicy(unittest.TestCase):
 
         self.assertEqual(parent.rrmc_access_count, 2)
         self.assertEqual(child.rrmc_access_count, 4)
+
+    def test_ranked_heap_pop_does_not_collect_lru_stream(self):
+        cache = make_heap_cache("lfu")
+        frequent = add_full_heap_leaf(
+            cache, access_time=1.0, access_count=5
+        )
+        infrequent = add_full_heap_leaf(
+            cache, access_time=2.0, access_count=1
+        )
+
+        def fail_collect(*args, **kwargs):
+            raise AssertionError("ranked heap should not collect LRU stream")
+
+        cache._collect_lru_stream_candidates = fail_collect
+
+        selected = cache._pop_rrmc_ranked_candidate("full")
+
+        self.assertIs(selected, infrequent)
+        self.assertIsNot(selected, frequent)
+
+    def test_ranked_heap_skips_stale_frequency_entry(self):
+        cache = make_heap_cache("lfu")
+        first = add_full_heap_leaf(cache, access_time=1.0, access_count=1)
+        second = add_full_heap_leaf(cache, access_time=2.0, access_count=2)
+
+        first.rrmc_access_count = 10
+        cache._rrmc_mark_node_updated(first)
+
+        selected = cache._pop_rrmc_ranked_candidate("full")
+
+        self.assertIs(selected, second)
 
     def test_depth_aware_lambda_zero_prefers_deeper_node(self):
         cache = make_cache("depth_aware", depth_lambda=0.0)
