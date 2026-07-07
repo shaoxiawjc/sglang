@@ -228,6 +228,8 @@ class RRMCMambaRadixCache(MambaRadixCache):
     def _rrmc_mark_node_updated(self, node: Optional[TreeNode]) -> None:
         if node is None or node is self.root_node:
             return
+        if self.rrmc_radix_eviction_policy not in RRMC_RANKED_EVICTION_POLICIES:
+            return
         self._ensure_rrmc_ranked_eviction_heaps()
         version = self._rrmc_next_heap_version(node)
         for memory_kind in self._rrmc_ranked_candidate_kinds_for_node(node):
